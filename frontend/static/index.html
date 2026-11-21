@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="color-scheme" content="light">
+    <meta name="theme-color" content="#ffffff">
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="/panel.css">
+    <title>chenniXvpn</title>
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">跳到主要内容</a>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <a class="brand" href="#/" aria-label="chenniXvpn 控制台首页">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 36 36" fill="none">
+              <g stroke="currentColor" stroke-width="3.1" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M5 21h5l4-10 6 16 4-13 3 7h4"/>
+              </g>
+            </svg>
+          </span>
+          <span class="brand-text"><strong>chenniXvpn</strong><span>个人控制台</span></span>
+        </a>
+        <nav class="main-nav" aria-label="主导航">
+          <a href="#/" aria-current="page"><span data-icon="overview"></span><span>概览</span></a>
+          <a href="#/traffic"><span data-icon="chart"></span><span>流量</span></a>
+          <a href="#/nodes"><span data-icon="network"></span><span>节点</span></a>
+          <a href="#/settings"><span data-icon="settings"></span><span>设置</span></a>
+        </nav>
+        <div class="sidebar-foot">
+          <span class="admin-avatar" aria-hidden="true"><span data-icon="lock"></span></span>
+          <span>管理员</span>
+        </div>
+      </aside>
+      <div class="workspace">
+        <header class="topbar">
+          <nav id="breadcrumbs" aria-label="当前位置">概览</nav>
+          <span id="connection" class="connection" role="status">正在连接</span>
+        </header>
+        <main id="main" class="main-area" tabindex="-1">
+          <div class="page-head">
+            <h1 id="heading">运行概览</h1>
+            <div id="page-actions" class="page-actions"></div>
+          </div>
+          <div id="job-status" role="status" aria-live="polite" hidden></div>
+          <div id="content"><p class="muted" role="status">正在读取面板数据…</p></div>
+          <noscript>请启用 JavaScript 以查看流量、管理节点和导入测速报告。</noscript>
+        </main>
+      </div>
+    </div>
+    <dialog id="dialog" aria-label="面板操作"></dialog>
+    <div id="notice" role="status" aria-live="polite" aria-atomic="true"></div>
+  </body>
+</html>
