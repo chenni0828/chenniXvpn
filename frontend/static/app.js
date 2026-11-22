@@ -832,7 +832,6 @@ content.addEventListener('change',async e=>{
   const input=e.target,file=input.files[0];if(!file)return;
   const seq=revision,key=getNode('vless').key;input.disabled=true;
   try{
-    if(file.name.toLowerCase().endsWith('-tcp.csv'))throw Error('请选择同一次测速生成的 *-report.csv');
     if(file.size>1000000)throw Error('请选择小于 1 MB 的 CSV');
     const data=await api('reports',{key,name:file.name,csv:await file.text()});
     if(seq===revision)openPage(diagnosticsPath+'/'+data.id);
