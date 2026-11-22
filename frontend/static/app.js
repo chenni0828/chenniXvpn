@@ -6,6 +6,7 @@ const content = $('#content'), dialog = $('#dialog');
 const names = {hy2:'Hysteria 2', vless:'VLESS'};
 const components = {project:'chenniXvpn', vless:'Xray', hy2:'Hysteria 2'};
 const kinds = {original:'原始入口', preferred:'优选入口', manual:'自选入口'};
+const diagnosticsPath = 'nodes/vless/diagnostics';
 const jobOperations = {create:'创建', repair:'恢复', configure:'修改', enable:'启用', disable:'停用', upgrade:'升级', retire_certificate:'清理证书'};
 const jobStates = {queued:['等待执行','neutral'], running:['正在执行','warn'], succeeded:['已完成','good'], failed:['执行失败','bad']};
 let traffic, server, report, page = [], revision = 0, noticeTimer, pendingShare, modalVersion = 0;
@@ -271,6 +272,22 @@ function reportScope(key) {
   if(nodeError || !server)return '配置状态待确认';
   return getNode('vless')?.key===key?'当前配置':'历史配置';
 }
+function deleteReportButton(r, label='删除') {
+  return btn('delete-report',label,'','small danger',
+    `data-id="${r.id}" data-name="${esc(r.name)}" aria-label="删除报告 ${esc(r.name)}"`);
+}
+function reportList(reports) {
+  if(!reports.length)return empty('还没有测速报告');
+  return `<div class="data-list">${reports.map(r=>`
+    <div class="report-list-item">
+      <a class="node-row" href="#/${diagnosticsPath}/${r.id}">
+        <span class="node-mark">${icon('chart')}</span>
+        <div><strong>${esc(r.name)}</strong><div class="muted">${reportMeta(r)} · ${r.usable}/${r.count} 可用</div></div>
+        ${icon('chevron')}
+      </a>
+      ${deleteReportButton(r)}
+    </div>`).join('')}</div>`;
+}
 async function nodePage(n,seq) {
   const root='nodes/'+n.protocol, section=page[2], tail=page[3];
   const crumbs=[['nodes','节点'],[root,names[n.protocol]]];
@@ -297,12 +314,13 @@ async function nodePage(n,seq) {
         report=detail;
         title='报告详情';
         crumbs.push([null,'报告详情']);
-        html=card(report.name,`<p class="report-meta">${reportMeta(report)}<span>${report.usable} / ${report.count} 个地址握手成功</span></p>${region('report-status')}${reportTable(report)}`);
+        html=card(report.name,`<p class="report-meta">${reportMeta(report)}<span>${report.usable} / ${report.count} 个地址握手成功</span></p>${region('report-status')}${reportTable(report)}`,
+          deleteReportButton(report,'删除报告'));
       }else{
         const reports=await api('reports');
         if(seq!==revision)return;
         html=card('导入测速 CSV',btn('choose-csv','选择 CSV','upload','primary','disabled')+'<input id="csv-file" type="file" accept=".csv,text/csv" hidden>'+region('import-status'))
-          +card('测速报告',reports.length?`<div class="data-list">${reports.map(r=>`<a class="node-row" href="#/nodes/vless/diagnostics/${r.id}"><span class="node-mark">${icon('chart')}</span><div><strong>${esc(r.name)}</strong><div class="muted">${reportMeta(r)} · ${r.usable}/${r.count} 可用</div></div>${icon('chevron')}</a>`).join('')}</div>`:empty('还没有测速报告'));
+          +card('测速报告',reportList(reports));
       }
     } catch(err) {
       html=empty(err.message);
@@ -672,6 +690,12 @@ function confirmCertificate(cert) {
     <button class="btn primary" type="submit">确认清理</button>
   </form>`);
 }
+function confirmReportDeletion(id,name) {
+  modal('删除测速报告',`<form id="delete-report-form" data-id="${id}">
+    <p>确定删除 <strong>${esc(name)}</strong>？删除后无法恢复。</p>
+    <button class="btn danger" type="submit">确认删除</button>
+  </form>`);
+}
 document.addEventListener('click',async e=>{
   const routeLink=e.target.closest('a[href^="#/"]');
   if(routeLink){
@@ -695,6 +719,7 @@ document.addEventListener('click',async e=>{
     if(action==='upgrade'){confirmUpgrade(b.dataset.target);return;}
     if(action==='retire-certificate'){confirmCertificate(b.dataset.cert);return;}
     if(action==='choose-csv'){$('#csv-file').click();return;}
+    if(action==='delete-report'){confirmReportDeletion(b.dataset.id,b.dataset.name);return;}
     if(action==='manual'){
       modal('自选入口',`<form id="manual-form"><label class="field">IP 或域名<input required maxlength="253" name="address" value="${esc(getNode('vless').entries.manual||'')}" placeholder="输入自选地址"></label><button class="btn primary" type="submit">预览链接与二维码</button></form>`);return;
     }
@@ -739,6 +764,15 @@ dialog.addEventListener('submit',async e=>{
       await queueJob({operation:'retire_certificate',target:'project',cert:f.dataset.cert});
       if(dialog.open && f.isConnected)dialog.close();
     }
+    if(f.id==='delete-report-form'){
+      const seq=revision, id=f.dataset.id;
+      await api('reports/'+encodeURIComponent(id)+'/delete',{});
+      if(seq!==revision)return;
+      if(dialog.open && f.isConnected)dialog.close();
+      notice('已删除测速报告');
+      if(page[3])openPage(diagnosticsPath);
+      else await render();
+    }
   }catch(err){notice(err.message);}finally{button.disabled=false;}
 });
 dialog.addEventListener('change',e=>{
@@ -771,7 +805,7 @@ content.addEventListener('change',async e=>{
   try{
     if(file.size>1000000)throw Error('请选择小于 1 MB 的 CSV');
     const data=await api('reports',{key,name:file.name,csv:await file.text()});
-    if(seq===revision)openPage('nodes/vless/diagnostics/'+data.id);
+    if(seq===revision)openPage(diagnosticsPath+'/'+data.id);
   }catch(err){notice(err.message);}finally{input.value='';input.disabled=false;}
 });
 function poll(refresh, isOpen, every) {

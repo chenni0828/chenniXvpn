@@ -7,6 +7,12 @@ from pathlib import Path
 
 ZONE = timezone(timedelta(hours=8))
 NET = Path("/sys/class/net")
+REPORTS_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS reports(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, node TEXT, name TEXT, ts REAL,
+        count INTEGER, usable INTEGER, best_ms REAL, rows_json TEXT, measured_at INTEGER
+    )
+"""
 
 
 class Store:
@@ -20,13 +26,22 @@ class Store:
                 CREATE TABLE IF NOT EXISTS baseline(id INTEGER PRIMARY KEY, iface TEXT, boot TEXT, idx INTEGER, ts REAL, rx INTEGER, tx INTEGER);
                 CREATE TABLE IF NOT EXISTS points(ts REAL PRIMARY KEY, rx_bps REAL, tx_bps REAL);
                 CREATE TABLE IF NOT EXISTS months(month TEXT PRIMARY KEY, rx INTEGER, tx INTEGER);
-                CREATE TABLE IF NOT EXISTS reports(id INTEGER PRIMARY KEY, node TEXT, name TEXT, ts REAL, count INTEGER, usable INTEGER, best_ms REAL, rows_json TEXT, measured_at INTEGER);
                 CREATE TABLE IF NOT EXISTS entries(node TEXT, kind TEXT, address TEXT, PRIMARY KEY(node,kind));
                 CREATE TABLE IF NOT EXISTS disabled_vless_entries(kind TEXT PRIMARY KEY);
             """)
             db.execute("BEGIN IMMEDIATE")
-            if not any(column["name"] == "measured_at" for column in db.execute("PRAGMA table_info(reports)")):
-                db.execute("ALTER TABLE reports ADD COLUMN measured_at INTEGER")
+            db.execute(REPORTS_SCHEMA)
+            schema = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='reports'").fetchone()[0]
+            if "AUTOINCREMENT" not in schema.upper():
+                columns = {column["name"] for column in db.execute("PRAGMA table_info(reports)")}
+                measured_at = "measured_at" if "measured_at" in columns else "NULL"
+                db.execute("ALTER TABLE reports RENAME TO old_reports")
+                db.execute(REPORTS_SCHEMA)
+                db.execute(f"""
+                    INSERT INTO reports(id,node,name,ts,count,usable,best_ms,rows_json,measured_at)
+                    SELECT id,node,name,ts,count,usable,best_ms,rows_json,{measured_at} FROM old_reports
+                """)
+                db.execute("DROP TABLE old_reports")
 
     @contextmanager
     def db(self):

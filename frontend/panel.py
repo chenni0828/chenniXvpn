@@ -244,6 +244,9 @@ class Panel:
                     view["target_verified"] = view["measured_at"] is not None
                     view["rows"] = json.loads(view.pop("rows_json"))
                     return view
+                if method == "POST" and len(parts) == 3 and parts[1].isdigit() and parts[2] == "delete":
+                    db.execute("DELETE FROM reports WHERE id=?", (parts[1],))
+                    return {"ok": True}
                 if method == "POST" and len(parts) == 1:
                     raw, key = self.raw("vless")
                     if body.get("key") != key:

@@ -327,6 +327,13 @@ textarea:focus-visible {
 .node-row > div { min-width: 0; overflow-wrap: anywhere; }
 .node-row > .icon:last-child { grid-column: -2 / -1; width: .9rem; height: .9rem; color: var(--muted); }
 .node-row strong { font-size: .98rem; font-weight: 640; }
+.report-list-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: .65rem;
+}
+.report-list-item + .report-list-item { border-top: 1px solid var(--soft-line); }
 .node-mark {
   justify-content: center;
   width: 2.4rem;
@@ -386,6 +393,8 @@ textarea:focus-visible {
 .btn.primary:hover, .btn.primary:active { background: #34383b; }
 .btn.ghost { background: transparent; }
 .btn.ghost:hover, .btn.ghost:active { background: var(--wash); }
+.btn.danger { color: #a43b33; }
+.btn.danger:hover, .btn.danger:active { border-color: #a43b33; background: #fff3f2; }
 .btn.small { padding: .35rem .65rem; font-size: .875rem; }
 .empty { padding: 1.1rem .9rem; border: 1px dashed var(--line); border-radius: .55rem; color: var(--muted); text-align: center; }
 .client-downloads { display: flex; flex-wrap: wrap; gap: .55rem; margin-block: .9rem; }
