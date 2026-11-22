@@ -75,3 +75,25 @@ sudo bash install.sh --status --json
 ### 创建节点
 
 登录面板，在「节点」中点击「创建节点」。将节点域名解析到 VPS，保持 TCP 80 开放以便签发和续期证书，并放行所选节点端口。VLESS 默认用 TCP 443，可与管理面板按域名共用端口；Hysteria 2 默认用 UDP 443，域名设为仅 DNS。节点启动后，在「连接与分享」复制链接或二维码，导入本地 VPN 客户端。
+
+### Cloudflare 测速与优选
+
+1. 在 VLESS 节点的「Cloudflare 诊断」下载测速任务和对应平台的客户端。
+2. 在平时连接节点的网络运行测速。Windows 双击 EXE 选择任务，也可以直接把任务文件拖到 EXE 上。Linux 使用 Python 3.10 或更新版本运行 `python3 chennixvpn-cloudflare-linux.py test --task chennixvpn-cf-task.json`。
+3. 导入生成的 `*-report.csv`，对照原始入口的握手表现。选择候选 IP 后预览并保存优选入口。
+
+Windows 将 `*-report.csv` 和完整初筛 `*-tcp.csv` 保存到 EXE 所在目录。从终端运行 EXE 时，请使用可写的工作目录供运行时临时解包。Linux 将 CSV 保存到当前工作目录。默认 IPv4 流程从 Cloudflare 网段按 `/24` 随机抽样，采用 200 并发、每地址 4 次 TCP 探测。复测前 40 个可达地址和原始入口的节点握手，再对最多 10 个通过的候选逐个测边缘下载，每个最多 10 秒。优选按握手成功率、握手延迟中位数和边缘下载速度排序。IPv6 使用同一脚本并追加 `--family 6`。
+
+### 构建测速发行资产
+
+在 Windows x64 的 Python 3.12 环境从项目根目录执行。把生成的两个文件随 `VERSION` 对应的服务器包放入同一 Release。
+
+```powershell
+python -m pip install pyinstaller==6.16.0
+$version = (Get-Content VERSION -Raw).Trim()
+$assetDir = ".artifacts/$version"
+$buildDir = ".artifacts/build-client-$version"
+New-Item -ItemType Directory -Force -Path $assetDir, $buildDir | Out-Null
+python -m PyInstaller --onefile --console --noupx --runtime-tmpdir '.' --name chennixvpn-cloudflare-windows-x64 --specpath $buildDir --workpath $buildDir --distpath $assetDir client/cf_speedtest.py
+Copy-Item client/cf_speedtest.py "$assetDir/chennixvpn-cloudflare-linux.py"
+```

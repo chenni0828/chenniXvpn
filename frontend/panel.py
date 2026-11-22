@@ -232,6 +232,11 @@ class Panel:
                 return {"logs": self.host.read("logs", protocol)}
             if method == "POST" and action == "share":
                 return self.share(protocol, body)
+            if method == "POST" and protocol == "vless" and action == "speedtest-task":
+                raw, key = self.raw(protocol)
+                if body.get("key") != key:
+                    raise HttpError(409, "节点已变更，请刷新后操作")
+                return Node.parse(raw).speedtest_task().payload()
         if parts[0] == "reports":
             with self.store.db() as db:
                 if method == "GET" and len(parts) == 1:
@@ -243,6 +248,7 @@ class Panel:
                     view = dict(row)
                     view["target_verified"] = view["measured_at"] is not None
                     view["rows"] = json.loads(view.pop("rows_json"))
+                    view["baseline"] = json.loads(view.pop("baseline_json") or "null")
                     return view
                 if method == "POST" and len(parts) == 3 and parts[1].isdigit() and parts[2] == "delete":
                     db.execute("DELETE FROM reports WHERE id=?", (parts[1],))
@@ -262,9 +268,11 @@ class Panel:
                         raise HttpError(409, "CSV 的测速目标与当前节点不一致，请重新测速")
                     rows = report.rows
                     usable = sum(r["successes"] > 0 for r in rows)
-                    cur = db.execute("INSERT INTO reports(node,name,ts,count,usable,best_ms,rows_json,measured_at) VALUES(?,?,?,?,?,?,?,?)",
+                    cur = db.execute("""INSERT INTO reports(node,name,ts,count,usable,best_ms,rows_json,measured_at,baseline_json)
+                                     VALUES(?,?,?,?,?,?,?,?,?)""",
                                      (key, name.strip()[:120], time.time(), len(rows), usable,
-                                      rows[0]["median_ms"] if usable else None, json.dumps(rows), report.measured_at))
+                                      rows[0]["median_ms"] if usable else None, json.dumps(rows), report.measured_at,
+                                      json.dumps(report.baseline) if report.baseline is not None else None))
                     return {"id": cur.lastrowid}
         raise HttpError(404, "接口不存在")
 

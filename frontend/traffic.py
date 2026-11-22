@@ -10,7 +10,7 @@ NET = Path("/sys/class/net")
 REPORTS_SCHEMA = """
     CREATE TABLE IF NOT EXISTS reports(
         id INTEGER PRIMARY KEY AUTOINCREMENT, node TEXT, name TEXT, ts REAL,
-        count INTEGER, usable INTEGER, best_ms REAL, rows_json TEXT, measured_at INTEGER
+        count INTEGER, usable INTEGER, best_ms REAL, rows_json TEXT, measured_at INTEGER, baseline_json TEXT
     )
 """
 
@@ -32,8 +32,8 @@ class Store:
             db.execute("BEGIN IMMEDIATE")
             db.execute(REPORTS_SCHEMA)
             schema = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='reports'").fetchone()[0]
+            columns = {column["name"] for column in db.execute("PRAGMA table_info(reports)")}
             if "AUTOINCREMENT" not in schema.upper():
-                columns = {column["name"] for column in db.execute("PRAGMA table_info(reports)")}
                 measured_at = "measured_at" if "measured_at" in columns else "NULL"
                 db.execute("ALTER TABLE reports RENAME TO old_reports")
                 db.execute(REPORTS_SCHEMA)
@@ -42,6 +42,8 @@ class Store:
                     SELECT id,node,name,ts,count,usable,best_ms,rows_json,{measured_at} FROM old_reports
                 """)
                 db.execute("DROP TABLE old_reports")
+            elif "baseline_json" not in columns:
+                db.execute("ALTER TABLE reports ADD COLUMN baseline_json TEXT")
 
     @contextmanager
     def db(self):

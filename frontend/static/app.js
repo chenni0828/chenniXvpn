@@ -198,20 +198,32 @@ function nodeTabs(n,section) {
   if(n.protocol==='vless')list.push([root+'/diagnostics','Cloudflare 诊断',section==='diagnostics']);
   return tabs(list);
 }
-function clientDownloads() {
+const diagnosticsReady = node => Boolean(!nodeError && node?.key && node.state==='active');
+function clientTools() {
   const links = [
     ['windows', 'Windows EXE · x64'],
-    ['linux', 'Linux 脚本']
+    ['linux', 'Linux Python 脚本']
   ].filter(([platform]) => server?.downloads?.[platform]);
   const buttons = links.map(([platform, title]) =>
     `<a class="btn" href="${esc(server.downloads[platform])}" target="_blank" rel="noopener noreferrer">${icon('download')}${title}</a>`).join('');
-  return card('客户端测速工具',`
-    <p class="muted">在实际使用节点的网络运行工具。Windows 双击 EXE，Linux 用 <code>python3</code> 运行脚本。工具会提示输入 VLESS 链接。</p>
-    <div class="client-downloads">${buttons || '<span class="muted">当前版本的下载链接暂不可用</span>'}</div>
-    <ul class="client-modes muted">
-      <li><strong>自选入口</strong> · 输入 IP 或域名，生成可导入的链接。</li>
-      <li><strong>优选入口</strong> · 按握手成功率和延迟排序，生成 CSV 后可在此导入。</li>
-    </ul>`);
+  return card('客户端测速',`
+    <p class="muted">下载当前节点的测速任务，在日常使用节点的网络运行客户端。</p>
+    <div class="client-downloads" aria-label="下载客户端">${buttons || '<span class="muted">当前版本的下载链接暂不可用</span>'}</div>
+    <p class="muted">Windows 双击 EXE 后选择任务文件，结果保存在 EXE 旁边。</p>
+    <p class="muted">Linux 运行 <code>python3 chennixvpn-cloudflare-linux.py test --task chennixvpn-cf-task.json</code>。</p>
+    ${region('task-status')}`,
+    btn('download-task','下载测速任务','download','primary','disabled'));
+}
+async function downloadTask() {
+  const task=await api('nodes/vless/speedtest-task',{key:getNode('vless').key});
+  const url=URL.createObjectURL(new Blob([JSON.stringify(task,null,2)+'\n'],{type:'application/json'}));
+  const anchor=document.createElement('a');
+  anchor.href=url;
+  anchor.download='chennixvpn-cf-task.json';
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
 }
 function entryCard(n,kind) {
   const addr=kind==='original'?n.domain:n.entries[kind];
@@ -223,18 +235,25 @@ function reportTable(report) {
   const stats = [
     {label:'成功率', value:r=>`${number(100*r.successes/r.attempts,1)}% <small>（${r.successes}/${r.attempts}）</small>`},
     {label:'握手中位数', value:r=>r.median_ms==null?'—':number(r.median_ms)+' ms'},
-    {label:'下载速度', value:r=>r.download_mbps==null?'未测':number(r.download_mbps)+' Mbps'},
+    {label:'Cloudflare 边缘下载', value:r=>r.download_mbps!=null?number(r.download_mbps)+' Mbps':
+      r.download_error?`<span class="muted">失败 · ${esc(r.download_error)}</span>`:'未测'},
   ];
   const canPrefer = report.target_verified;
   const headings = ['候选 IP', ...stats.map(s=>s.label)];
   if (canPrefer) headings.push('分享');
   return `<div class="table-wrap"><table class="table report-table"><thead><tr>
     ${headings.map(label=>`<th scope="col">${label}</th>`).join('')}
-    </tr></thead><tbody>${report.rows.map(r=>`<tr>
-      <td class="result-address mono">${esc(r.ip)}${r.error?`<div class="muted">${esc(r.error)}</div>`:''}</td>
+    </tr></thead><tbody>${report.rows.map((r,i)=>`<tr>
+      <td class="result-address mono">${esc(r.ip)}${canPrefer && i===0 && r.successes===r.attempts?' '+pill('推荐','good'):''}${r.error?`<div class="muted">${esc(r.error)}</div>`:''}</td>
       ${stats.map(s=>`<td class="result-stat" data-label="${s.label}">${s.value(r)}</td>`).join('')}
       ${canPrefer?`<td class="result-action">${r.successes?btn('prefer','预览','qr','small',`data-ip="${esc(r.ip)}"`):'<span class="muted">不可用</span>'}</td>`:''}
     </tr>`).join('')}</tbody></table></div>`;
+}
+function reportBaseline(baseline) {
+  if(!baseline)return '';
+  const latency=baseline.median_ms==null?'':' · 握手中位数 '+number(baseline.median_ms)+' ms';
+  const failure=baseline.error?' · '+esc(baseline.error):'';
+  return `<p class="muted">原始入口 · ${baseline.successes}/${baseline.attempts} 次握手成功${latency}${failure}</p>`;
 }
 function nodeHealth(n) {
   const health=n.health||{};
@@ -314,19 +333,20 @@ async function nodePage(n,seq) {
         report=detail;
         title='报告详情';
         crumbs.push([null,'报告详情']);
-        html=card(report.name,`<p class="report-meta">${reportMeta(report)}<span>${report.usable} / ${report.count} 个地址握手成功</span></p>${region('report-status')}${reportTable(report)}`,
+        html=card(report.name,`<p class="report-meta">${reportMeta(report)}<span>${report.usable} / ${report.count} 个地址握手成功</span></p>${reportBaseline(report.baseline)}${region('report-status')}${reportTable(report)}`,
           deleteReportButton(report,'删除报告'));
       }else{
         const reports=await api('reports');
         if(seq!==revision)return;
-        html=card('导入测速 CSV',btn('choose-csv','选择 CSV','upload','primary','disabled')+'<input id="csv-file" type="file" accept=".csv,text/csv" hidden>'+region('import-status'))
+        html=card('导入测速报告',`<p class="muted">选择客户端生成的 <code>*-report.csv</code>。</p>${region('import-status')}<input id="csv-file" type="file" accept=".csv,text/csv" hidden>`,
+          btn('choose-csv','选择报告','upload','primary','disabled'))
           +card('测速报告',reportList(reports));
       }
     } catch(err) {
       html=empty(err.message);
       actions+=btn('refresh','重试','refresh','ghost');
     }
-    if(!tail) html=clientDownloads()+html;
+    if(!tail) html=clientTools()+html;
   }else if(!section){
     html=region('node-status-error',stale(nodeError,server.checked_at))+region('node-connection',connectionContent(n));
     actions+=region('node-badge',stateOf(n));
@@ -417,7 +437,10 @@ function updateNodeViews() {
   if (!$('[data-region="entry-settings"] input:disabled')) replaceRegion('entry-settings',entrySettings());
   const node=getNode(page[1]);
   if(page[2]==='diagnostics'){
-    const live=Boolean(!nodeError && node?.key && node.state==='active');
+    const live=diagnosticsReady(node);
+    const task=$('[data-action="download-task"]');
+    if(task)task.disabled=!live || task.getAttribute('aria-busy')==='true';
+    replaceRegion('task-status',live?'':empty('启动 VLESS 后可下载当前节点的测速任务。'));
     const choose=$('[data-action="choose-csv"]');
     if(choose)choose.disabled=!live;
     replaceRegion('import-status',live?'':empty('启动 VLESS 后可导入当前节点的报告。'));
@@ -724,6 +747,11 @@ document.addEventListener('click',async e=>{
       modal('自选入口',`<form id="manual-form"><label class="field">IP 或域名<input required maxlength="253" name="address" value="${esc(getNode('vless').entries.manual||'')}" placeholder="输入自选地址"></label><button class="btn primary" type="submit">预览链接与二维码</button></form>`);return;
     }
     b.disabled=true;
+    if(action==='download-task'){
+      b.setAttribute('aria-busy','true');
+      await downloadTask();
+      return;
+    }
     if(action==='share')await sharing(b.dataset.kind);
     if(action==='prefer')await sharing('preferred',{address:b.dataset.ip,report:report.id});
     if(action==='copy'){
@@ -735,7 +763,8 @@ document.addEventListener('click',async e=>{
       dialog.close();notice('已保存入口');if(location.hash==='#/nodes/vless')await render();else openPage('nodes/vless');
     }
   }catch(err){notice(err.message);}finally{
-    b.disabled=false;
+    if(action==='download-task')b.removeAttribute('aria-busy');
+    b.disabled=action==='download-task' && !diagnosticsReady(getNode('vless'));
     updateNodeActions();
   }
 });
@@ -803,6 +832,7 @@ content.addEventListener('change',async e=>{
   const input=e.target,file=input.files[0];if(!file)return;
   const seq=revision,key=getNode('vless').key;input.disabled=true;
   try{
+    if(file.name.toLowerCase().endsWith('-tcp.csv'))throw Error('请选择同一次测速生成的 *-report.csv');
     if(file.size>1000000)throw Error('请选择小于 1 MB 的 CSV');
     const data=await api('reports',{key,name:file.name,csv:await file.text()});
     if(seq===revision)openPage(diagnosticsPath+'/'+data.id);
