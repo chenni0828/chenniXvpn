@@ -172,11 +172,13 @@ class Panel:
             return self.store.traffic(self.host.interfaces())
         if method == "GET" and path == "jobs":
             return self.host.operate("jobs")
+        if method == "GET" and path == "installed-versions":
+            return self.host.operate("installed-versions")
         if method == "GET" and len(parts) == 2 and parts[0] == "jobs" and JOB_ID.fullmatch(parts[1]):
             return self.host.operate("job", id=parts[1])
         if method == "POST" and path == "jobs":
             fields = {"operation", "target", "domain", "port", "email", "cloudflare", "open_firewall",
-                      "version", "cert"}
+                      "version", "cert", "release_id"}
             if not body.keys() <= fields:
                 raise HttpError(400, "任务请求含有未知字段")
             return self.host.operate("start", **body)

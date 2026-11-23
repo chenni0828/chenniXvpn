@@ -7,12 +7,13 @@ const names = {hy2:'Hysteria 2', vless:'VLESS'};
 const components = {project:'chenniXvpn', vless:'Xray', hy2:'Hysteria 2'};
 const kinds = {original:'原始入口', preferred:'优选入口', manual:'自选入口'};
 const diagnosticsPath = 'nodes/vless/diagnostics';
-const jobOperations = {create:'创建', repair:'恢复', configure:'修改', enable:'启用', disable:'停用', upgrade:'升级', retire_certificate:'清理证书'};
+const jobOperations = {create:'创建', repair:'恢复', configure:'修改', enable:'启用', disable:'停用', upgrade:'升级', retire_certificate:'清理证书', delete_release:'清理旧版本'};
 const jobStates = {queued:['等待执行','neutral'], running:['正在执行','warn'], succeeded:['已完成','good'], failed:['执行失败','bad']};
 let traffic, server, report, page = [], revision = 0, noticeTimer, pendingShare, modalVersion = 0;
 let scrollTarget = null;
 let trafficError, nodeError, nodeVersion = 0;
 let jobs = [], jobsError, updates, updatesError, checkingUpdates = false, submittingJob = false, jobVersion = 0;
+let installedVersions, installedVersionsError;
 let trafficDeadline = 0, trafficExpiryTimer, trafficRequest = 0;
 let jobsTimer, readingJobs = false, listRequested = false;
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -397,10 +398,29 @@ function updateRows() {
       ${status?.error?`<span class="update-error" role="status">${esc(status.error)}</span>`:action}</div>`;
   }).join('');
 }
+function releaseSource(source) {
+  if(source?.kind==='github-release')return 'GitHub Release'+(source.tag?' · '+source.tag:'');
+  if(source?.kind==='git')return 'Git 源码'+(source.commit?' · '+source.commit.slice(0,12):'');
+  if(source?.kind==='source')return '本地源码';
+  return '来源未知';
+}
+function installedVersionRows() {
+  if(installedVersionsError)return stale(installedVersionsError);
+  if(!installedVersions)return empty('正在读取本机已保存版本');
+  if(!installedVersions.releases.length)return empty('没有已保存的面板版本');
+  const status={current:['当前运行','good'],rollback:['保留回滚','neutral'],deletable:['可清理','neutral'],protected:['受保护','warn']};
+  return `<p class="card-caption">仅保存面板源码；当前版和最近一个旧版不可删除。</p><div class="data-list">${installedVersions.releases.map(item=>{
+    const [label,style]=status[item.status]||status.protected;
+    const action=item.status==='deletable'?btn('delete-release','删除','close','small danger',
+      `data-id="${esc(item.id)}" ${nodeMutationsDisabled()?'disabled':''}`):'';
+    return `<div class="update-row release-row"><strong>${esc(item.version)} ${pill(label,style)}</strong><div class="update-versions"><span>${date(item.deployed_at)}</span><span>${esc(releaseSource(item.source))}</span><span>${item.size_bytes==null?'大小未知':bytes(item.size_bytes)}</span>${item.reason?`<span class="muted">${esc(item.reason)}</span>`:''}</div>${action}</div>`;
+  }).join('')}</div>`;
+}
 function updatesPage() {
   const check=btn('check-updates','检查更新','refresh','primary',checkingUpdates?'disabled':'');
   const panel=card('版本更新',region('updates-list',updateRows()),check);
-  layout('设置',[['settings','设置'],[null,'更新']],`<div class="stack">${settingsTabs(true)}${panel}</div>`);
+  const installed=card('本机已保存版本',region('installed-versions',installedVersionRows()));
+  layout('设置',[['settings','设置'],[null,'更新']],`<div class="stack">${settingsTabs(true)}${panel}${installed}</div>`);
 }
 function settingsPage() {
   const services=card('协议服务','<p class="muted">停用会断开该协议的连接，并关闭开机自启。重新启用后可继续使用原有节点。</p>'+region('protocol-settings',protocolSettings()));
@@ -419,7 +439,8 @@ function updateNodeActions() {
   if(node)replaceRegion('node-edit',editNodeButton(node));
   replaceRegion('protocol-settings',protocolSettings());
   replaceRegion('updates-list',updateRows());
-  for(const button of document.querySelectorAll('[data-action="create-node"], [data-action="edit-node"], [data-action="set-protocol"], [data-action="upgrade"], [data-action="retire-certificate"]')) {
+  replaceRegion('installed-versions',installedVersionRows());
+  for(const button of document.querySelectorAll('[data-action="create-node"], [data-action="edit-node"], [data-action="set-protocol"], [data-action="upgrade"], [data-action="retire-certificate"], [data-action="delete-release"]')) {
     button.disabled=nodeMutationsDisabled() || (button.dataset.action==='upgrade' && checkingUpdates);
   }
 }
@@ -498,6 +519,11 @@ async function refreshJobs() {
         await refreshNodes(seq);
         if(seq===revision && getNode(page[1]) && !dialog.open && $('[data-region="node-unavailable"]'))await render();
       }else if(after.operation==='upgrade' && after.target==='project')updates=null;
+      if(after.operation==='delete_release' || (after.operation==='upgrade' && after.target==='project')) {
+        installedVersions=null;
+        installedVersionsError=null;
+        if(page.join('/')==='settings/updates')await refreshInstalledVersions();
+      }
       if(getNode(page[1])?.protocol===after.target)await render();
       if(after.operation==='retire_certificate')await render();
       if(after.state==='succeeded') {
@@ -524,6 +550,17 @@ async function refreshJobs() {
 function scheduleJobs() {
   clearTimeout(jobsTimer);
   jobsTimer=setTimeout(refreshJobs,jobs.find(jobPending)?1500:60000);
+}
+
+async function refreshInstalledVersions() {
+  try {
+    installedVersions=await api('installed-versions');
+    installedVersionsError=null;
+  } catch(err) {
+    installedVersions=null;
+    installedVersionsError='本机版本读取失败：'+err.message;
+  }
+  if(page.join('/')==='settings/updates')replaceRegion('installed-versions',installedVersionRows());
 }
 
 async function queueJob(payload) {
@@ -618,7 +655,10 @@ async function render() {
       if(seq!==revision)return;
       settingsPage();
     }
-    else if(page.join('/')==='settings/updates')updatesPage();
+    else if(page.join('/')==='settings/updates'){
+      updatesPage();
+      void refreshInstalledVersions();
+    }
     else if(page[0]==='nodes' && Object.hasOwn(names,page[1])){
       await nodesRequest;
       if(seq!==revision)return;
@@ -713,6 +753,15 @@ function confirmCertificate(cert) {
     <button class="btn primary" type="submit">确认清理</button>
   </form>`);
 }
+function confirmReleaseDeletion(id) {
+  const item=installedVersions?.releases.find(release=>release.id===id && release.status==='deletable');
+  if(!item){notice('该版本已变化或受保护，请刷新后重试');return;}
+  modal('删除本机旧版本',`<form id="delete-release-form" data-id="${esc(item.id)}">
+    <p>确定删除 <strong>${esc(item.version)}</strong> 的旧源码？此操作无法恢复。</p>
+    <p class="muted">只删除旧源码，不影响数据库、节点、密码、证书或测速报告。当前版和最近一个旧版会保留。</p>
+    <button class="btn danger" type="submit">确认删除</button>
+  </form>`);
+}
 function confirmReportDeletion(id,name) {
   modal('删除测速报告',`<form id="delete-report-form" data-id="${id}">
     <p>确定删除 <strong>${esc(name)}</strong>？删除后无法恢复。</p>
@@ -743,6 +792,7 @@ document.addEventListener('click',async e=>{
     if(action==='retire-certificate'){confirmCertificate(b.dataset.cert);return;}
     if(action==='choose-csv'){$('#csv-file').click();return;}
     if(action==='delete-report'){confirmReportDeletion(b.dataset.id,b.dataset.name);return;}
+    if(action==='delete-release'){confirmReleaseDeletion(b.dataset.id);return;}
     if(action==='manual'){
       modal('自选入口',`<form id="manual-form"><label class="field">IP 或域名<input required maxlength="253" name="address" value="${esc(getNode('vless').entries.manual||'')}" placeholder="输入自选地址"></label><button class="btn primary" type="submit">预览链接与二维码</button></form>`);return;
     }
@@ -801,6 +851,10 @@ dialog.addEventListener('submit',async e=>{
       notice('已删除测速报告');
       if(page[3])openPage(diagnosticsPath);
       else await render();
+    }
+    if(f.id==='delete-release-form'){
+      await queueJob({operation:'delete_release',target:'project',release_id:f.dataset.id});
+      if(dialog.open && f.isConnected)dialog.close();
     }
   }catch(err){notice(err.message);}finally{button.disabled=false;}
 });

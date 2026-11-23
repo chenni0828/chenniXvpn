@@ -23,7 +23,9 @@ SERVICE = "chennixvpn-operation.service"
 TARGETS = ("project", "hy2", "vless")
 RUNNING = {"queued", "running"}
 OPERATIONS = {"create", "configure", "repair", "enable", "disable", "upgrade", "retire_certificate"}
+OPERATIONS.add("delete_release")
 OPTIONAL = {"cloudflare", "open_firewall"}
+RELEASE_ID = re.compile(r"(?:app/)?v\d{1,5}\.\d{1,5}\.\d{1,5}(?:\.\d{1,5})?-[0-9a-f]{8}")
 
 
 class RequestError(Exception):
@@ -71,6 +73,11 @@ def request_arguments(request):
     if operation == "retire_certificate":
         if target != "project" or set(fields) != {"cert"} or not isinstance(fields["cert"], str):
             raise RequestError("证书清理参数无效。")
+    elif operation == "delete_release":
+        if target != "project" or set(fields) != {"release_id"} or not isinstance(fields["release_id"], str):
+            raise RequestError("旧版本清理参数无效。")
+        if not RELEASE_ID.fullmatch(fields["release_id"]):
+            raise RequestError("旧版本标识无效。")
     elif operation in {"create", "configure"} and target != "project":
         if fields.keys() - OPTIONAL != {"domain", "port", "email"}:
             raise RequestError("节点操作需要域名、端口和邮箱。")
@@ -124,10 +131,166 @@ def install_latest(tag):
     return f"面板已升级至 {tag}。"
 
 
+def current_release_id():
+    try:
+        target = os.readlink(deploy.CURRENT)
+    except OSError:
+        raise RuntimeError("无法确认当前面板版本，已停止清理。") from None
+    if "/" in target or "\\" in target or not RELEASE_ID.fullmatch(target):
+        raise RuntimeError("当前面板目录不符合版本管理要求，已停止清理。")
+    return target
+
+
+def release_source(path):
+    source = {"kind": "unknown", "tag": None, "commit": None}
+    try:
+        metadata = path / "source.json"
+        if metadata.is_symlink():
+            return source
+        saved = json.loads(metadata.read_text(encoding="utf-8"))
+    except (FileNotFoundError, UnicodeError, json.JSONDecodeError, OSError):
+        return source
+    if not isinstance(saved, dict) or saved.get("kind") not in {"source", "github-release", "git", "unknown"}:
+        return source
+    source["kind"] = saved["kind"]
+    if isinstance(saved.get("tag"), str):
+        try:
+            version_key(saved["tag"])
+        except ValueError:
+            pass
+        else:
+            source["tag"] = saved["tag"]
+    if isinstance(saved.get("commit"), str) and re.fullmatch(r"[0-9a-f]{40,64}", saved["commit"]):
+        source["commit"] = saved["commit"]
+    return source
+
+
+def directory_size(path):
+    total = 0
+    with os.scandir(path) as entries:
+        for entry in entries:
+            if entry.is_symlink():
+                raise ValueError("版本目录包含链接，已停止读取大小。")
+            if entry.is_dir(follow_symlinks=False):
+                total += directory_size(Path(entry.path))
+            elif entry.is_file(follow_symlinks=False):
+                total += entry.stat(follow_symlinks=False).st_size
+            else:
+                raise ValueError("版本目录包含特殊文件，已停止读取大小。")
+    return total
+
+
+def installed_versions_unlocked():
+    releases = []
+    current = current_release_id()
+    try:
+        entries = list(os.scandir(deploy.BASE / "releases"))
+    except FileNotFoundError:
+        entries = []
+    for entry in entries:
+        if not RELEASE_ID.fullmatch(entry.name) or entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+            continue
+        path = Path(entry.path)
+        directory_mtime_ns = entry.stat(follow_symlinks=False).st_mtime_ns
+        item = {"id": entry.name, "version": entry.name.rsplit("-", 1)[0], "source": release_source(path),
+                "size_bytes": None, "deployed_at": int(directory_mtime_ns / 1_000_000_000),
+                "directory_mtime_ns": directory_mtime_ns,
+                "status": "current" if entry.name == current else "older", "reason": None}
+        try:
+            if version_key(deploy.read_text(path / "VERSION")) != version_key(item["version"]):
+                raise ValueError("目录与 VERSION 不一致，不能删除。")
+            item["size_bytes"] = directory_size(path)
+        except (ValueError, OSError) as exc:
+            item["status"] = "protected"
+            item["reason"] = str(exc)
+        if item["status"] == "current":
+            item["reason"] = "当前运行的版本不能删除。"
+        releases.append(item)
+    releases.sort(key=lambda item: (version_key(item["version"]), item["deployed_at"], item["id"]), reverse=True)
+    rollback = next((item for item in releases if item["status"] == "older"), None)
+    if rollback:
+        rollback.update(status="rollback", reason="保留为最近一次回滚版本。")
+    for item in releases:
+        if item["status"] == "older":
+            item.update(status="deletable", reason=None)
+    return {"releases": releases}
+
+
+def installed_versions():
+    with deploy.deployment_lock(read_only=True):
+        return installed_versions_unlocked()
+
+
+def remove_release(path):
+    if not hasattr(os, "O_DIRECTORY"):
+        raise OSError("版本目录安全删除需要 Linux 目录描述符支持。")
+
+    def remove(directory_fd):
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                if entry.is_symlink():
+                    raise ValueError("版本目录包含链接，已停止清理。")
+                if entry.is_dir(follow_symlinks=False):
+                    child_fd = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
+                    try:
+                        remove(child_fd)
+                    finally:
+                        os.close(child_fd)
+                    os.rmdir(entry.name, dir_fd=directory_fd)
+                elif entry.is_file(follow_symlinks=False):
+                    os.unlink(entry.name, dir_fd=directory_fd, follow_symlinks=False)
+                else:
+                    raise ValueError("版本目录包含特殊文件，已停止清理。")
+
+    directory_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        remove(directory_fd)
+    finally:
+        os.close(directory_fd)
+    os.rmdir(path)
+
+
+def path_changed(release_id, item):
+    path = deploy.BASE / "releases" / release_id
+    if path.is_symlink() or not path.is_dir():
+        return True
+    try:
+        return (deploy.read_text(path / "VERSION") != item["version"] or directory_size(path) != item["size_bytes"] or
+                path.stat().st_mtime_ns != item["directory_mtime_ns"])
+    except OSError:
+        return True
+
+
+def delete_release(release_id):
+    if not RELEASE_ID.fullmatch(release_id):
+        raise ValueError("旧版本标识无效。")
+    current = current_release_id()
+    if release_id == current:
+        raise ValueError("当前运行的版本不能删除。")
+    releases = installed_versions_unlocked()["releases"]
+    item = next((item for item in releases if item["id"] == release_id), None)
+    if not item:
+        raise ValueError("旧版本不存在或目录无效。")
+    if item["status"] != "deletable":
+        raise ValueError(item["reason"] or "该版本受保护，不能删除。")
+    if current_release_id() != current:
+        raise ValueError("当前版本已变化，请刷新后重试。")
+    path = deploy.BASE / "releases" / release_id
+    if path_changed(release_id, item):
+        raise ValueError("旧版本目录已变化，请刷新后重试。")
+    try:
+        remove_release(path)
+    except OSError:
+        raise ValueError("旧版本目录无法安全删除，请刷新后重试。") from None
+    return f"已删除旧版本 {item['version']}。"
+
+
 def execute(job):
     target, operation, fields = (job[key] for key in ("target", "operation", "fields"))
     if operation == "retire_certificate":
         return nodes.retire_certificate(fields["cert"])
+    if operation == "delete_release":
+        return delete_release(fields["release_id"])
     if target == "project":
         return install_latest(fields["version"])
     if operation in {"create", "configure", "repair"}:
@@ -145,10 +308,15 @@ def work(job_id):
     job = job_read(job_id)
     job_write(dict(job, state="running", message="正在执行。"))
     try:
+        job = job_read(job_id)
+        if job["state"] != "running":
+            raise RuntimeError("操作已中断，请重试。")
         deploy.validate_platform()
         os.umask(0o022)
         if job["target"] == "project" and job["operation"] == "upgrade":
             message = execute(job)
+        elif job["operation"] == "delete_release" and not job.get("current_delete"):
+            return run_current_delete(job)
         else:
             with deploy.deployment_lock():
                 message = execute(job)
@@ -162,6 +330,18 @@ def work(job_id):
         job_write(dict(job, state="failed", message="操作失败，请查看 chennixvpn-operation.service 的系统日志。"))
         raise
     job_write(dict(job, state="succeeded", message=message))
+    return 0
+
+
+def run_current_delete(job):
+    job_write(dict(job, current_delete=True))
+    try:
+        deploy.run(sys.executable, "-I", deploy.CURRENT / "server/operations.py", "--run", job["id"])
+    except RuntimeError:
+        saved = job_read(job["id"])
+        if saved["state"] == "failed":
+            raise RuntimeError(saved["message"]) from None
+        raise
     return 0
 
 
@@ -188,6 +368,8 @@ def dispatch(request):
     if action == "versions":
         with ThreadPoolExecutor(max_workers=len(TARGETS)) as pool:
             return dict(zip(TARGETS, pool.map(version_status, TARGETS)))
+    if action == "installed-versions":
+        return installed_versions()
     raise RequestError("无效的请求。")
 
 
