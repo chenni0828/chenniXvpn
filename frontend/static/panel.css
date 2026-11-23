@@ -617,7 +617,7 @@ textarea:focus-visible {
   .report-table .result-address { grid-area: 1 / 1 / 2 / 3; align-self: center; font-size: 1rem; font-weight: 600; }
   .result-address .muted { font-weight: 400; }
   .report-table .result-action { grid-area: 1 / 3; align-self: center; justify-self: end; }
-  .result-stat { grid-row: 2; overflow-wrap: anywhere; }
+  .result-stat { overflow-wrap: anywhere; }
   .result-stat::before { content: attr(data-label); display: block; margin-bottom: .18rem; font-size: .75rem; color: var(--muted); }
   .result-stat small { display: inline-block; }
 }
@@ -671,7 +671,7 @@ textarea:focus-visible {
   .report-table tbody tr { grid-template-columns: minmax(0, 1fr) auto; }
   .report-table .result-address { grid-column: 1; }
   .report-table .result-action { grid-column: 2; }
-  .result-stat { grid-column: 1 / -1; grid-row: auto; }
+  .result-stat { grid-column: 1 / -1; }
   .result-stat::before { display: inline; margin-right: .65rem; }
 }
 @media (max-width: 26rem) {

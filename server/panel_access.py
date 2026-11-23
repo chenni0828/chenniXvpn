@@ -28,23 +28,19 @@ def requested_settings(args, previous, *, prompt):
             raise ValueError(f"需要明确指定 --{option.replace('_', '-')}（{label}）。")
         return default
 
-    requested_mode = getattr(args, "mode", None)
-    if requested_mode not in (None, "https"):
-        raise ValueError("管理面板只支持公网 HTTPS。")
-    previous = previous or {}
-    prior = previous if previous.get("mode") == "https" else {}
+    prior = previous or {}
     port = d.port_value(int(value("port", "面板 HTTPS 端口", prior.get("port", 443))))
     if port == d.VLESS_LOOPBACK or (port < 1024 and port != 443):
         raise ValueError("管理端口须为 1024–65535，HTTPS 也可用 443；18080 预留给 VLESS。")
     domain = d.domain_value(value("domain", "管理域名", prior.get("domain")))
     email = d.email_value(value("email", "证书邮箱", prior.get("email")))
-    local = previous.get("local_port")
+    local = prior.get("local_port")
     reserved = {port} | vless_ports()
     if not local or local in reserved:
         local = next((i for i in range(9080, 9100) if i not in reserved and d.loopback_available(i)), None)
     if local is None:
         raise ValueError("没有可用的面板回环端口（9080–9099）。")
-    return dict(mode="https", domain=domain, email=email, port=port, local_port=local,
+    return dict(domain=domain, email=email, port=port, local_port=local,
                 cert=d.node_cert_name("panel", domain))
 
 

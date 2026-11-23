@@ -26,7 +26,7 @@ ARCHIVE_COMMIT = "$Format:%H$"
 def version_key(tag):
     match = re.fullmatch(r"(?:app/)?v(\d{1,5})\.(\d{1,5})\.(\d{1,5})(?:\.(\d{1,5}))?", tag)
     if not match:
-        raise ValueError("需要正式版标签，例如 v0.1.0 或 app/v2.6.0。")
+        raise ValueError("需要正式版标签，例如 v0.2.0 或 app/v2.6.0。")
     return tuple(int(part or 0) for part in match.groups())
 
 

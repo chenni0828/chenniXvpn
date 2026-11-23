@@ -97,15 +97,13 @@ def info(protocol, sockets, now):
     ingress = listener(sockets, "tcp", public_port, re.compile(r'\("nginx",')) if protocol == "vless" and state == "active" else "unchecked"
     loaded_cert = hy2_loaded_certificate(cert, pid) if protocol == "hy2" and state == "active" else "unchecked"
     installed_state = "installed" if installed else "incomplete"
-    legacy_raw = node_manager.legacy_mappings(protocol, config)[1] if installed else None
     return dict(protocol=protocol, installed=installed, install_state=installed_state,
                 state=state, enabled=unit.get("UnitFileState") == "enabled", boot_state=unit.get("UnitFileState"),
                 domain=config.get("domain"), port=public_port, expires=expires, version=status["version"],
                 can_repair=status["can_repair"], conflicts=status["conflicts"],
-                email=config.get("email"), cloudflare=config.get("cloudflare", False), open_firewall=False,
+                email=config.get("email"), cloudflare=config.get("cloudflare", False),
                 up_mbps=config.get("up_mbps", 0), down_mbps=config.get("down_mbps", 0),
                 key=hashlib.sha256(raw.encode()).hexdigest() if installed else None,
-                legacy_key=hashlib.sha256(legacy_raw.encode()).hexdigest() if legacy_raw else None,
                 health=dict(checked_at=now, listener=core, ingress=ingress,
                             certificate=cert_status, loaded_certificate=loaded_cert))
 

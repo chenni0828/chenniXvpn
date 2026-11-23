@@ -30,20 +30,10 @@ class Store:
                 CREATE TABLE IF NOT EXISTS disabled_vless_entries(kind TEXT PRIMARY KEY);
             """)
             db.execute("BEGIN IMMEDIATE")
-            db.execute(REPORTS_SCHEMA)
-            schema = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='reports'").fetchone()[0]
             columns = {column["name"] for column in db.execute("PRAGMA table_info(reports)")}
-            if "AUTOINCREMENT" not in schema.upper():
-                measured_at = "measured_at" if "measured_at" in columns else "NULL"
-                db.execute("ALTER TABLE reports RENAME TO old_reports")
-                db.execute(REPORTS_SCHEMA)
-                db.execute(f"""
-                    INSERT INTO reports(id,node,name,ts,count,usable,best_ms,rows_json,measured_at)
-                    SELECT id,node,name,ts,count,usable,best_ms,rows_json,{measured_at} FROM old_reports
-                """)
-                db.execute("DROP TABLE old_reports")
-            elif "baseline_json" not in columns:
-                db.execute("ALTER TABLE reports ADD COLUMN baseline_json TEXT")
+            if columns and "baseline_json" not in columns:
+                db.execute("DROP TABLE reports")
+            db.execute(REPORTS_SCHEMA)
 
     @contextmanager
     def db(self):

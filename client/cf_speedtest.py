@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Select or benchmark Cloudflare addresses for an existing VLESS WebSocket node."""
+"""Benchmark Cloudflare Anycast addresses for a chenniXvpn VLESS WebSocket node."""
 
 import argparse
 import base64
@@ -9,6 +9,7 @@ import http.client
 import io
 import ipaddress
 import json
+import math
 import os
 import random
 import re
@@ -19,7 +20,6 @@ import sys
 import tempfile
 import time
 import urllib.parse as url
-import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -30,30 +30,35 @@ from pathlib import Path
 
 WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 DOWNLOAD_HOST = "speed.cloudflare.com"
-CLOUDFLARE_IPS_URL = "https://api.cloudflare.com/client/v4/ips"
 CLOUDFLARE_HTTPS_PORTS = {443, 2053, 2083, 2087, 2096, 8443}
-# Snapshot of https://www.cloudflare.com/ips-v4 for networks that cannot reach the API.
+# Curated public Anycast CDN ranges; excludes EIV/1034-restricted and DNS/Spectrum-heavy blocks.
 CLOUDFLARE_IPV4 = (
-    "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "104.16.0.0/13", "104.24.0.0/14",
-    "108.162.192.0/18", "131.0.72.0/22", "141.101.64.0/18", "162.158.0.0/15", "172.64.0.0/13",
-    "173.245.48.0/20", "188.114.96.0/20", "190.93.240.0/20", "197.234.240.0/22", "198.41.128.0/17",
+    "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+    "104.16.0.0/13", "104.24.0.0/14", "131.0.72.0/22",
+    "141.101.64.0/18", "162.158.0.0/16", "172.66.0.0/15",
+    "188.114.96.0/20", "190.93.240.0/20", "197.234.240.0/22",
 )
-REPORT_VERSION = "1"
+CLOUDFLARE_IPV6 = (
+    "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32",
+    "2405:b500::/32", "2405:8100::/32", "2a06:98c0::/29", "2c0f:f248::/32",
+)
+REPORT_VERSION = "2"
 TASK_VERSION = 1
 DEFAULT_SAMPLE = 24
-DEFAULT_ATTEMPTS = 3
 DEFAULT_WORKERS = 8
 DEFAULT_TIMEOUT = 4
 TCP_WORKERS = 96
 TCP_ATTEMPTS = 3
 TCP_TIMEOUT = 1
-WS_SHORTLIST = 48
+WS_SHORTLIST = 64
 DOWNLOAD_TOP = 10
 DOWNLOAD_TIMEOUT = 10
 DOWNLOAD_READ_TIMEOUT = 8
 DOWNLOAD_MIN_SECONDS = 0.25
 DOWNLOAD_BYTES = 25_000_000
 MAX_DOWNLOAD_BYTES = 100_000_000
+GOOD_DOWNLOAD_MBPS = 5.0
+LATENCY_TIER_MS = 250.0
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -149,17 +154,13 @@ class Node:
     path: str
 
     @classmethod
-    def from_file(cls, path):
-        return cls.parse(path.read_text(encoding="utf-8-sig"))
-
-    @classmethod
     def parse(cls, text):
         text = text.strip()
         if not text or any(char.isspace() for char in text):
-            raise ValueError("URI 文件必须只含一行 VLESS 链接")
+            raise ValueError("URI 必须只含一行 VLESS 链接")
         parsed = url.urlsplit(text)
         if parsed.scheme != "vless" or not parsed.hostname or not parsed.username or parsed.password is not None:
-            raise ValueError("URI 文件必须包含有效的 vless:// 链接")
+            raise ValueError("必须包含有效的 vless:// 链接")
         try:
             uuid.UUID(parsed.username)
         except ValueError:
@@ -185,7 +186,14 @@ class Node:
     def link(self, address):
         if ":" in address:
             address = f"[{address}]"
-        params = self.params | {"sni": self.sni, "host": self.host}
+        early_path = f"{self.path}&ed=2048" if "?" in self.path else f"{self.path}?ed=2048"
+        params = self.params | {
+            "sni": self.sni,
+            "host": self.host,
+            "alpn": "http/1.1",
+            "fp": "chrome",
+            "path": early_path,
+        }
         return self.uri._replace(
             netloc=f"{self.uri.username}@{address}:{self.port}",
             query=url.urlencode(params),
@@ -242,23 +250,6 @@ def candidates(source, family, limit):
             if len(picked) == limit:
                 break
     return [str(ip) for ip in picked]
-
-
-def cloudflare_networks(family, timeout):
-    request = urllib.request.Request(CLOUDFLARE_IPS_URL, headers={"Accept": "application/json"})
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(request, timeout=timeout) as response:
-        source = response.read(65537)
-    if len(source) > 65536:
-        raise ValueError("Cloudflare IP 列表超出预期大小")
-    payload = json.loads(source)
-    if not isinstance(payload, dict) or payload.get("success") is not True:
-        raise ValueError("Cloudflare IP 列表不可用")
-    result = payload.get("result")
-    networks = result.get(f"ipv{family}_cidrs") if isinstance(result, dict) else None
-    if not isinstance(networks, list) or not networks or not all(isinstance(item, str) for item in networks):
-        raise ValueError(f"Cloudflare IPv{family} 列表格式无效")
-    return networks
 
 
 def detect_local_proxy():
@@ -319,15 +310,6 @@ def warn_if_proxied():
         )
 
 
-def load_candidates(args):
-    sample = args.sample or DEFAULT_SAMPLE
-    if args.candidates:
-        source = args.candidates.read_text(encoding="utf-8-sig")
-        return candidates(source, args.family, sample)
-    family = args.family or 4
-    return candidates("\n".join(cloudflare_networks(family, args.timeout)), family, sample)
-
-
 def ipv4_subnet_samples(networks):
     blocks = list(ipaddress.collapse_addresses(ipaddress.IPv4Network(network) for network in networks))
     if not 0 < sum(1 << max(0, 24 - block.prefixlen) for block in blocks) <= 20_000:
@@ -344,13 +326,14 @@ def ipv4_subnet_samples(networks):
 
 
 def task_candidates(args):
-    if args.candidates or args.sample is not None or args.family == 6:
-        return load_candidates(args)
-    try:
-        return ipv4_subnet_samples(cloudflare_networks(4, args.timeout))
-    except (OSError, ValueError, http.client.HTTPException):
-        print("Cloudflare 网段接口暂不可用，使用内置的 IPv4 网段。", flush=True)
-        return ipv4_subnet_samples(CLOUDFLARE_IPV4)
+    if args.candidates:
+        source = args.candidates.read_text(encoding="utf-8-sig")
+        return candidates(source, args.family, args.sample or DEFAULT_SAMPLE)
+    if args.family == 6:
+        return candidates("\n".join(CLOUDFLARE_IPV6), 6, args.sample or DEFAULT_SAMPLE)
+    if args.sample is not None:
+        return candidates("\n".join(CLOUDFLARE_IPV4), 4, args.sample)
+    return ipv4_subnet_samples(CLOUDFLARE_IPV4)
 
 
 def remaining_time(deadline):
@@ -377,13 +360,16 @@ class DeadlineReader(io.RawIOBase):
 
 
 @contextmanager
-def edge_response(ip, port, sni, host, path, headers, timeout, context, *, read_timeout=None):
+def edge_response(ip, port, sni, host, path, headers, timeout, context, *, read_timeout=None, on_tcp=None):
     request = f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {USER_AGENT}\r\n{headers}\r\n"
     deadline = time.perf_counter() + timeout
+    tcp_start = time.perf_counter()
     try:
         raw = socket.create_connection((ip, port), timeout=timeout)
     except OSError as exc:
         raise ProbeError(failure_message(exc, "TCP 连接")) from exc
+    if on_tcp is not None:
+        on_tcp((time.perf_counter() - tcp_start) * 1000)
     with raw:
         try:
             raw.settimeout(remaining_time(deadline))
@@ -406,6 +392,7 @@ class Result:
     ip: str
     attempts: int
     successes: int
+    tcp_ms: float | None
     median_ms: float | None
     error: str
     colo: str = ""
@@ -437,25 +424,18 @@ def extract_colo(response):
 def ip_bucket(ip_text):
     addr = ipaddress.ip_address(ip_text)
     if addr.version == 4:
-        return str(ipaddress.IPv4Network(f"{addr}/16", strict=False).network_address)
+        return str(ipaddress.IPv4Network(f"{addr}/18", strict=False).network_address)
     return str(ipaddress.IPv6Network(f"{addr}/48", strict=False).network_address)
 
 
-def diversify_shortlist(tcp_results, limit=WS_SHORTLIST):
-    ordered = sorted(
-        (r for r in tcp_results if r.successes > 0),
-        key=lambda r: (-r.successes, r.average_ms if r.average_ms is not None else float("inf"), r.ip),
-    )
-    buckets = {}
-    for result in ordered:
-        buckets.setdefault(ip_bucket(result.ip), []).append(result.ip)
+def _round_robin(buckets, remaining):
     picked = []
     queues = list(buckets.values())
-    while queues and len(picked) < limit:
+    while queues and len(picked) < remaining:
         next_queues = []
         for queue in queues:
             picked.append(queue.pop(0))
-            if len(picked) == limit:
+            if len(picked) == remaining:
                 break
             if queue:
                 next_queues.append(queue)
@@ -463,21 +443,41 @@ def diversify_shortlist(tcp_results, limit=WS_SHORTLIST):
     return picked
 
 
-def select_download_queue(usable_results, limit):
-    buckets = {}
-    for result in usable_results:
-        buckets.setdefault(result.colo or result.ip, []).append(result)
+def diversify_shortlist(tcp_results, limit=WS_SHORTLIST):
+    ordered = sorted(
+        (r for r in tcp_results if r.successes > 0),
+        key=lambda r: (-r.successes, r.average_ms if r.average_ms is not None else float("inf"), r.ip),
+    )
+    fast_limit = limit // 2
+    bucket_cap = max(1, limit // 4)
     picked = []
-    queues = list(buckets.values())
-    while queues and len(picked) < limit:
-        next_queues = []
-        for queue in queues:
-            picked.append(queue.pop(0))
-            if len(picked) == limit:
-                break
-            if queue:
-                next_queues.append(queue)
-        queues = next_queues
+    seen = set()
+    bucket_counts = {}
+    for result in ordered:
+        if len(picked) >= fast_limit:
+            break
+        bucket = ip_bucket(result.ip)
+        if bucket_counts.get(bucket, 0) >= bucket_cap:
+            continue
+        bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+        picked.append(result)
+        seen.add(result.ip)
+
+    buckets = {}
+    for result in ordered:
+        if result.ip not in seen:
+            buckets.setdefault(ip_bucket(result.ip), []).append(result)
+    picked.extend(_round_robin(buckets, limit - len(picked)))
+    return picked
+
+
+def select_download_queue(usable_results, limit):
+    direct_count = min(len(usable_results), limit // 2)
+    picked = list(usable_results[:direct_count])
+    buckets = {}
+    for result in usable_results[direct_count:]:
+        buckets.setdefault(result.colo or result.ip, []).append(result)
+    picked.extend(_round_robin(buckets, limit - len(picked)))
     return picked
 
 
@@ -533,8 +533,9 @@ def tcp_probe(ip, port, attempts):
     return TCPResult(ip, attempts, len(timings), statistics.mean(timings) if timings else None, error)
 
 
-def probe(ip, node, attempts, timeout, context):
+def probe(ip, task, attempts, timeout, context, *, initial_tcp_ms=None):
     timings = []
+    tcp_timings = []
     error = ""
     colo = ""
     for _ in range(attempts):
@@ -546,7 +547,8 @@ def probe(ip, node, attempts, timeout, context):
         )
         start = time.perf_counter()
         try:
-            with edge_response(ip, node.port, node.sni, node.host, node.path, headers, timeout, context) as response:
+            with edge_response(ip, task.port, task.sni, task.host, task.path, headers, timeout, context,
+                               on_tcp=tcp_timings.append) as response:
                 found_colo = extract_colo(response)
                 if found_colo:
                     colo = found_colo
@@ -562,7 +564,9 @@ def probe(ip, node, attempts, timeout, context):
             if isinstance(exc, ProbeError) and exc.colo:
                 colo = exc.colo
             error = failure_message(exc)
-    return Result(ip, attempts, len(timings), statistics.median(timings) if timings else None, error, colo=colo)
+    tcp_ms = statistics.median(tcp_timings) if tcp_timings else initial_tcp_ms
+    median_ms = statistics.median(timings) if timings else None
+    return Result(ip, attempts, len(timings), tcp_ms, median_ms, error, colo=colo)
 
 
 def download(result, size, timeout, context, *, port=443, timed_sample=False):
@@ -595,13 +599,27 @@ def download(result, size, timeout, context, *, port=443, timed_sample=False):
         result.download_error = failure_message(exc)
 
 
-def rank_candidate(ip, attempts, successes, median_ms, download_mbps):
+def rank_candidate(ip, attempts, successes, median_ms, download_mbps, tcp_ms=None):
     latency = median_ms if median_ms is not None else float("inf")
-    return -successes / attempts, download_mbps is None, -(download_mbps or 0), latency, ip
+    edge_tcp = tcp_ms if tcp_ms is not None else latency
+    has_good_speed = download_mbps is not None and download_mbps >= GOOD_DOWNLOAD_MBPS
+    tcp_tier = int(edge_tcp // 50.0) if math.isfinite(edge_tcp) else 999999
+    latency_tier = int(latency // LATENCY_TIER_MS) if math.isfinite(latency) else 999999
+    return (
+        -successes / attempts,
+        not has_good_speed,
+        tcp_tier,
+        latency_tier,
+        download_mbps is None,
+        -(download_mbps or 0),
+        edge_tcp,
+        latency,
+        ip,
+    )
 
 
 def rank(result):
-    return rank_candidate(result.ip, result.attempts, result.successes, result.median_ms, result.mbps)
+    return rank_candidate(result.ip, result.attempts, result.successes, result.median_ms, result.mbps, result.tcp_ms)
 
 
 @contextmanager
@@ -618,14 +636,19 @@ def output_file(path, encoding, newline):
             temp.unlink(missing_ok=True)
 
 
-def write_csv(path, results, node, measured_at, baseline=None):
-    metadata = (REPORT_VERSION, node.target_fingerprint(), measured_at)
-    columns = ["rank", "ip", "colo", "attempts", "successes", "failure_pct", "median_ms", "download_mbps",
-               "error", "download_error", "report_version", "target_fingerprint", "measured_at"]
-    comparison = ()
-    if baseline is not None:
-        columns.extend(("baseline_attempts", "baseline_successes", "baseline_median_ms", "baseline_error", "baseline_colo"))
-        comparison = (baseline.attempts, baseline.successes, baseline.median_ms, baseline.error, baseline.colo)
+def write_csv(path, results, task, measured_at, baseline):
+    metadata = (REPORT_VERSION, task.target_fingerprint(), measured_at)
+    comparison = (
+        baseline.attempts, baseline.successes, baseline.tcp_ms,
+        baseline.median_ms, baseline.error, baseline.colo,
+    )
+    columns = [
+        "rank", "ip", "colo", "attempts", "successes", "failure_pct",
+        "tcp_ms", "median_ms", "download_mbps", "error", "download_error",
+        "report_version", "target_fingerprint", "measured_at",
+        "baseline_attempts", "baseline_successes", "baseline_tcp_ms",
+        "baseline_median_ms", "baseline_error", "baseline_colo",
+    ]
     with output_file(path, "utf-8-sig", "") as out:
         rows = csv.writer(out)
         rows.writerow(columns)
@@ -633,13 +656,9 @@ def write_csv(path, results, node, measured_at, baseline=None):
             rows.writerow([
                 number, result.ip, result.colo, result.attempts, result.successes,
                 f"{100 * (1 - result.successes / result.attempts):.1f}",
-                result.median_ms, result.mbps, result.error, result.download_error, *metadata, *comparison,
+                result.tcp_ms, result.median_ms, result.mbps, result.error, result.download_error,
+                *metadata, *comparison,
             ])
-
-
-def write_links(path, links):
-    with output_file(path, "utf-8", "\n") as out:
-        out.writelines(f"{link}\n" for link in links)
 
 
 def windows_executable_dir():
@@ -648,32 +667,19 @@ def windows_executable_dir():
     return None
 
 
-def output_path(path):
-    directory = windows_executable_dir()
-    if directory is None:
-        return path
-    resolved = (directory / path).resolve()
-    if resolved.parent != directory:
-        raise ValueError("生成的文件必须保存在 EXE 所在目录")
-    return resolved
-
-
 def task_output_dir():
-    executable_dir = windows_executable_dir()
-    directory = executable_dir or Path.cwd()
+    directory = windows_executable_dir() or Path.cwd()
     try:
         with tempfile.NamedTemporaryFile(dir=directory):
-            pass
+            return directory
     except OSError as exc:
-        hint = "请将 EXE 移入可写目录" if executable_dir else "请从可写目录运行脚本"
-        raise ValueError(f"无法在 {directory} 保存测速结果。{hint}。") from exc
-    return directory
+        raise ValueError(f"无法在 {directory} 保存测速结果，请检查目录写入权限。") from exc
 
 
-def measure_many(addresses, workers, measure, label):
+def measure_many(items, workers, measure, label):
     results = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        pending = [pool.submit(measure, address) for address in addresses]
+        pending = [pool.submit(measure, item) for item in items]
         try:
             for index, future in enumerate(as_completed(pending), 1):
                 results.append(future.result())
@@ -704,10 +710,19 @@ def test_task(args, task):
         print("没有地址通过 TCP 初筛，请检查网络和节点端口后重试。", file=sys.stderr)
         return 1
     context = ssl.create_default_context()
-    print(f"复测原始入口和 {len(shortlist)} 个候选（按 /16 网段分散选取）。", flush=True)
+    print(f"复测原始入口和 {len(shortlist)} 个候选（按 /18 网段分散选取）。", flush=True)
     baseline = probe(task.original_address, task, args.attempts, args.timeout, context)
-    results = measure_many(shortlist, DEFAULT_WORKERS,
-                           lambda ip: probe(ip, task, args.attempts, args.timeout, context), "节点握手")
+    results = measure_many(
+        shortlist, DEFAULT_WORKERS,
+        lambda item: probe(item.ip, task, args.attempts, args.timeout, context, initial_tcp_ms=item.average_ms),
+        "节点握手",
+    )
+    if args.colo:
+        for result in results:
+            if result.successes > 0 and result.colo not in args.colo:
+                result.successes = 0
+                result.median_ms = None
+                result.error = f"非目标机房 ({result.colo})" if result.colo else "未识别机房"
     results.sort(key=rank)
     usable = [r for r in results if r.successes]
     download_queue = select_download_queue(usable, args.download_top)
@@ -725,70 +740,10 @@ def test_task(args, task):
         return 1
     best = results[0]
     colo_tag = f" ({best.colo})" if best.colo else ""
+    tcp_tag = f" · 边缘 TCP {best.tcp_ms:.1f} ms" if best.tcp_ms is not None else ""
+    ws_tag = f" · 节点握手 {best.median_ms:.1f} ms" if best.median_ms is not None else ""
     speed_tag = f" · {best.mbps:.1f} Mbps" if best.mbps is not None else ""
-    print(f"{len(usable)}/{len(results)} 个候选通过握手，首选 {best.ip}{colo_tag} · {best.successes}/{best.attempts} 次成功{speed_tag}。")
-    return 0
-
-
-def check(args, node):
-    address = address_value(args.address if args.address is not None else node.uri.hostname)
-    target = f"[{address}]:{node.port}" if ":" in address else f"{address}:{node.port}"
-    result = probe(address, node, 1, args.timeout, ssl.create_default_context())
-    if not result.successes:
-        print(f"{target} 检查失败：{result.error}", file=sys.stderr)
-        return 1
-    colo_tag = f" · 机房 {result.colo}" if result.colo else ""
-    print(f"{target} 通过 TCP、TLS 证书与 WebSocket 101 检查（{result.median_ms:.1f} ms{colo_tag}）。")
-    return 0
-
-
-def test(args, node):
-    warn_if_proxied()
-    ips = task_candidates(args) if getattr(args, "full_scan", False) else load_candidates(args)
-    if not ips:
-        raise ValueError("候选列表为空或与所选的 IP 版本不匹配")
-    context = ssl.create_default_context()
-    two_stage = len(ips) > WS_SHORTLIST
-    if two_stage:
-        tcp_workers = args.workers if args.workers != DEFAULT_WORKERS else TCP_WORKERS
-        print(f"TCP 初筛 {len(ips)} 个地址，每个地址连接 {args.attempts} 次，{tcp_workers} 并发。", flush=True)
-        tcp_results = measure_many(ips, tcp_workers, lambda ip: tcp_probe(ip, node.port, args.attempts), "TCP 初筛")
-        ips = diversify_shortlist(tcp_results, WS_SHORTLIST)
-        if not ips:
-            print("没有地址通过 TCP 初筛，请检查网络和节点端口后重试。", file=sys.stderr)
-            return 1
-        print(f"复测 {len(ips)} 个候选（按 /16 网段分散选取）。", flush=True)
-    else:
-        print(f"正在测试 {len(ips)} 个地址，每个地址握手 {args.attempts} 次。", flush=True)
-    ws_workers = DEFAULT_WORKERS if two_stage else args.workers
-    results = measure_many(ips, ws_workers,
-                           lambda ip: probe(ip, node, args.attempts, args.timeout, context), "节点握手")
-    results.sort(key=rank)
-    usable = [result for result in results if result.successes]
-    if args.download and usable:
-        download_queue = select_download_queue(usable, args.download_top)
-        for index, result in enumerate(download_queue, 1):
-            colo_tag = f" ({result.colo})" if result.colo else ""
-            print(f"Cloudflare 边缘下载 {index}/{len(download_queue)} · {result.ip}{colo_tag}", flush=True)
-            download(result, args.download_bytes, args.timeout, context,
-                     port=node.port, timed_sample=args.download_bytes >= 10_000_000)
-        results.sort(key=rank)
-        usable = [result for result in results if result.successes]
-
-    write_csv(args.csv, results, node, int(time.time()))
-    print(f"测速结果：{args.csv}")
-    for hint in diagnose_results(None, results):
-        print(hint, file=sys.stderr, flush=True)
-    if not usable:
-        print("没有地址通过 WebSocket 握手，请检查 CSV 中的错误。", file=sys.stderr)
-        return 1
-    best = results[0]
-    colo_tag = f" ({best.colo})" if best.colo else ""
-    speed_tag = f" · {best.mbps:.1f} Mbps" if best.mbps is not None else ""
-    print(f"通过 {len(usable)}/{len(results)}，首选 {best.ip}{colo_tag}，握手中位数 {best.median_ms:.1f} ms{speed_tag}。")
-    if args.links:
-        write_links(args.links, (node.link(result.ip) for result in usable[:args.count]))
-        print(f"导入链接：{args.links}")
+    print(f"{len(usable)}/{len(results)} 个候选通过握手，首选 {best.ip}{colo_tag} · {best.successes}/{best.attempts} 次成功{tcp_tag}{ws_tag}{speed_tag}。")
     return 0
 
 
@@ -801,46 +756,11 @@ def bounded(converter, low, high):
     return parse
 
 
-def interactive():
-    print("chenniXvpn Cloudflare 自选与优选")
-    print("使用面板中 VLESS 节点的原始链接。请在平时使用节点的网络中测速。")
-    try:
-        while True:
-            print("\n1. 自选 IP 或域名\n2. 测速优选\n0. 退出")
-            choice = input("请选择 [1/2/0]：").strip()
-            if choice == "0":
-                return 0
-            if choice not in ("1", "2"):
-                print("请输入 1、2 或 0。")
-                continue
-            try:
-                node = Node.parse(input("粘贴原始 VLESS 链接："))
-                if choice == "1":
-                    address = address_value(input("输入自选 IP 或域名：").strip())
-                    print(f"复制以下链接到客户端导入：\n{node.link(address)}")
-                    continue
-                family = input("Cloudflare 候选地址版本 [4/6，默认 4]：").strip() or "4"
-                if family not in ("4", "6"):
-                    raise ValueError("请选择 IPv4 或 IPv6。")
-                filename = datetime.now().strftime("cf-results-%Y%m%d-%H%M%S-%f.csv")
-                report = Path.home() / "chennixvpn" / filename
-                args = argparse.Namespace(
-                    candidates=None, family=int(family), sample=None if family == "4" else DEFAULT_SAMPLE,
-                    full_scan=(family == "4"),
-                    attempts=TCP_ATTEMPTS if family == "4" else DEFAULT_ATTEMPTS,
-                    workers=TCP_WORKERS if family == "4" else DEFAULT_WORKERS,
-                    timeout=DEFAULT_TIMEOUT, download=True, download_top=DOWNLOAD_TOP,
-                    download_bytes=DOWNLOAD_BYTES, csv=report, links=None, count=5,
-                )
-                if test(args, node) == 0:
-                    print("在 VLESS 节点的 Cloudflare 页面导入该 CSV，然后选择一个握手成功的地址。")
-            except (ValueError, OSError, http.client.HTTPException) as exc:
-                print(f"错误：{exc}", file=sys.stderr)
-    except EOFError:
-        return 0
-    except KeyboardInterrupt:
-        print("\n已取消。")
-        return 130
+def colo_filter(value):
+    codes = {part.strip().upper() for part in value.split(",") if part.strip()}
+    if not codes or any(not re.fullmatch(r"[A-Z]{3}", code) for code in codes):
+        raise argparse.ArgumentTypeError("机房过滤须为逗号分隔的三字母机场代码，例如 NRT,KIX,HKG")
+    return codes
 
 
 def choose_windows_task():
@@ -896,74 +816,30 @@ def desktop(task_path=None):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if not argv:
-        return desktop() if windows_executable_dir() else interactive()
-    if windows_executable_dir() and len(argv) == 1 and Path(argv[0]).suffix.lower() == ".json":
-        return desktop(argv[0])
+    if windows_executable_dir():
+        if not argv:
+            return desktop()
+        if len(argv) == 1 and Path(argv[0]).suffix.lower() == ".json":
+            return desktop(argv[0])
     parser = argparse.ArgumentParser(
-        description="从客户端检查 VLESS + WebSocket + TLS 节点，或测速和选择 Cloudflare IP。",
-        epilog="使用 test --task 运行 Cloudflare 诊断页导出的任务。",
+        description="基于面板导出的测速任务筛选 Cloudflare 优选 IP 并生成导入报告。",
+        epilog="示例：test --task chennixvpn-cf-task.json --colo NRT,KIX,HKG",
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    public_check = commands.add_parser("check", help="从当前机器验证单个目标的 TCP、TLS 和 WebSocket")
-    public_check.add_argument("--uri-file", type=Path, required=True)
-    public_check.add_argument("--address", help="指定连接 IP 或域名，省略时使用节点地址")
-    public_check.add_argument("--timeout", type=bounded(float, 0.5, 30), default=DEFAULT_TIMEOUT, help="连接和读取的超时秒数")
-    select = commands.add_parser("select", help="用指定 IP 或域名生成链接")
-    select.add_argument("--uri-file", type=Path, required=True)
-    select.add_argument("--address", required=True, help="自选 IP 或域名")
-    select.add_argument("--out", type=Path, required=True)
-    speed = commands.add_parser("test", help="并发测试候选地址并输出 CSV")
-    source = speed.add_mutually_exclusive_group(required=True)
-    source.add_argument("--task", type=Path, help="Cloudflare 诊断页导出的 JSON 测速任务")
-    source.add_argument("--uri-file", type=Path, help="读取原始 VLESS 链接，使用原有测速模式")
-    speed.add_argument("--candidates", type=Path, help="每行一个 IP 或 CIDR。省略时使用 Cloudflare 官方网段")
-    speed.add_argument("--family", type=int, choices=(4, 6), help="仅测指定 IP 版本，官方列表默认 IPv4")
-    speed.add_argument("--sample", type=bounded(int, 1, 256), help="限制抽样数，省略时任务模式按 IPv4 /24 抽样")
-    speed.add_argument("--full-scan", action="store_true", help="原始链接模式下按 Cloudflare IPv4 /24 全网段抽样")
-    speed.add_argument("--attempts", type=bounded(int, 1, 10))
-    speed.add_argument("--workers", type=bounded(int, 1, TCP_WORKERS))
+    speed = commands.add_parser("test", help="并发测试 Cloudflare 候选地址并输出 CSV")
+    speed.add_argument("--task", type=Path, required=True, help="Cloudflare 诊断页导出的 JSON 测速任务")
+    speed.add_argument("--candidates", type=Path, help="每行一个 IP 或 CIDR。省略时使用 Cloudflare 公共 CDN 网段")
+    speed.add_argument("--family", type=int, choices=(4, 6), help="仅测指定 IP 版本，默认 IPv4")
+    speed.add_argument("--sample", type=bounded(int, 1, 256), help="限制抽样数，省略时按 IPv4 /24 全量抽样")
+    speed.add_argument("--colo", type=colo_filter, help="仅保留指定三字母机房（如 NRT,KIX,HKG,ICN）")
+    speed.add_argument("--attempts", type=bounded(int, 1, 10), default=TCP_ATTEMPTS)
+    speed.add_argument("--workers", type=bounded(int, 1, TCP_WORKERS), default=TCP_WORKERS)
     speed.add_argument("--timeout", type=bounded(float, 0.5, 30), default=DEFAULT_TIMEOUT, help="连接和读取的超时秒数")
-    speed.add_argument("--download", action="store_true", help="原始链接模式下启用 Cloudflare 边缘下载测速")
-    speed.add_argument("--download-top", type=bounded(int, 1, 20), help="任务模式最多测速 10 个候选")
-    speed.add_argument("--download-bytes", type=bounded(int, 100_000, MAX_DOWNLOAD_BYTES))
-    speed.add_argument("--csv", type=Path, help="原始链接模式的 CSV 输出路径")
-    speed.add_argument("--links", type=Path, help="另存包含凭据的导入链接到新文件")
-    speed.add_argument("--count", type=bounded(int, 1, 25), default=5, help="最多导出的链接数")
+    speed.add_argument("--download-top", type=bounded(int, 1, 20), default=DOWNLOAD_TOP, help="最多测速的候选数量")
+    speed.add_argument("--download-bytes", type=bounded(int, 100_000, MAX_DOWNLOAD_BYTES), default=DOWNLOAD_BYTES)
     args = parser.parse_args(argv)
     try:
-        if args.command == "test" and args.task:
-            if args.csv is not None or args.links is not None:
-                raise ValueError("任务模式会生成带时间戳的 CSV，节点分享链接请在面板预览")
-            args.attempts = args.attempts or TCP_ATTEMPTS
-            args.workers = args.workers or TCP_WORKERS
-            args.download_top = min(args.download_top or DOWNLOAD_TOP, DOWNLOAD_TOP)
-            args.download_bytes = args.download_bytes or DOWNLOAD_BYTES
-            return test_task(args, SpeedtestTask.from_file(args.task))
-        node = Node.from_file(args.uri_file)
-        if args.command == "check":
-            return check(args, node)
-        if args.command == "select":
-            args.out = output_path(args.out)
-            if args.uri_file.resolve() == args.out.resolve():
-                raise ValueError("输出路径必须与原始链接文件不同")
-            write_links(args.out, [node.link(address_value(args.address))])
-            print(f"导入链接：{args.out}")
-            return 0
-        args.attempts = args.attempts or DEFAULT_ATTEMPTS
-        args.workers = args.workers or DEFAULT_WORKERS
-        args.download_top = args.download_top or 5
-        args.download_bytes = args.download_bytes or 1_000_000
-        default_csv = "cf-results.csv" if windows_executable_dir() else "output/cf-results.csv"
-        args.csv = output_path(args.csv or Path(default_csv))
-        if args.links:
-            args.links = output_path(args.links)
-        paths = [path.resolve() for path in (args.uri_file, args.candidates, args.csv, args.links) if path is not None]
-        if len(set(paths)) != len(paths):
-            raise ValueError("输入、CSV 和链接输出必须使用不同路径")
-        if args.links and args.links.exists():
-            raise ValueError("链接输出文件已存在，请指定新的 --links 路径")
-        return test(args, node)
+        return test_task(args, SpeedtestTask.from_file(args.task))
     except (ValueError, OSError, http.client.HTTPException) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 2

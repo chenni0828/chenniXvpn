@@ -35,6 +35,7 @@ SYSCTL = Path("/etc/sysctl.d/99-chennixvpn.conf")
 SYSCTL_CONFIG = """# Managed by chenniXvpn
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen = 3
 net.core.rmem_max = 16777216
 net.core.wmem_max = 16777216
 net.core.rmem_default = 262144
@@ -244,13 +245,9 @@ def node_config(target, pending=False):
         if not trusted_file(record, private=True) or record.stat().st_size > 4096:
             raise ValueError
         lines = record.read_text().splitlines()
-        if len(lines) == 9:
-            domain, internal, secret, path, public, email, cert, cloudflare, firewall = lines
-            up_text, down_text = "0", "0"
-        elif len(lines) == 11:
-            domain, internal, secret, path, public, email, cert, cloudflare, firewall, up_text, down_text = lines
-        else:
+        if len(lines) != 10:
             raise ValueError
+        domain, internal, secret, path, public, email, cert, cloudflare, up_text, down_text = lines
         port = port_value(int(public))
         up_mbps = bandwidth_value(int(up_text))
         down_mbps = bandwidth_value(int(down_text))
@@ -261,10 +258,10 @@ def node_config(target, pending=False):
                 or int(internal) != (port if target == "hy2" else VLESS_LOOPBACK)
                 or not re.fullmatch(valid_secret, secret)
                 or not re.fullmatch("" if target == "hy2" else r"/ws-[0-9a-f]{24}", path)
-                or cloudflare not in ("true", "false") or firewall != "false"):
+                or cloudflare not in ("true", "false")):
             raise ValueError
         return dict(domain=domain, internal=int(internal), secret=secret, path=path, port=port,
-                    email=email_value(email), cert=cert, cloudflare=cloudflare == "true", open_firewall=False,
+                    email=email_value(email), cert=cert, cloudflare=cloudflare == "true",
                     up_mbps=up_mbps, down_mbps=down_mbps)
     except FileNotFoundError:
         return None
@@ -314,6 +311,10 @@ def tls_site(domain, port, cert, location, include_acme=True):
     ssl_certificate {lineage}/fullchain.pem;
     ssl_certificate_key {lineage}/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:chennixvpn_tls:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets on;
+    tcp_nodelay on;
     client_max_body_size 2m;
     {location}
 }}
@@ -418,8 +419,6 @@ def issue_certificate(domain, email, cert, previous_domain):
 
 
 def panel_origin(config):
-    if config.get("mode") != "https":
-        raise ValueError("管理面板只支持公网 HTTPS。")
     port = config["port"]
     return "https://" + config["domain"] + (f":{port}" if port != 443 else "")
 
@@ -583,12 +582,10 @@ def copy_project(source, destination):
 
 
 def panel_response(config, *, verify_tls=True):
-    https = config.get("mode") == "https"
-    domain = config["domain"] if https else None
-    port = config["port"] if https else config["local_port"]
-    host = f"{domain}:{port}" if domain and port != 443 else domain
-    response, connection = local_http(port, "/api/nodes", domain, {"Host": host} if host else None,
-                                      verify_tls=verify_tls)
+    domain = config["domain"]
+    port = config["port"]
+    host = f"{domain}:{port}" if port != 443 else domain
+    response, connection = local_http(port, "/api/nodes", domain, {"Host": host}, verify_tls=verify_tls)
     with response:
         try:
             return response.status, response.getheader("WWW-Authenticate", "")
@@ -631,7 +628,7 @@ def install_project_locked(source, config, *, admin_hash, provenance, previous=N
     print("正在检查并安装系统依赖。", file=sys.stderr, flush=True)
     had_ss = bool(shutil.which("ss", path=ENV["PATH"]))
     packages("python3", "gunicorn", "sudo", "ca-certificates", "openssl", "iproute2")
-    if not had_ss and (fresh or (previous and previous.get("mode") == "ssh")):
+    if not had_ss and fresh:
         check_ingress(config, previous)
     packages("nginx", "certbot")
     if run("id", USER, check=False, capture=True).returncode:
@@ -666,8 +663,7 @@ def install_project_locked(source, config, *, admin_hash, provenance, previous=N
         run("visudo", "-cf", candidate_rule)
 
         print("正在验证 HTTPS 证书。", file=sys.stderr, flush=True)
-        previous_domain = (previous.get("domain")
-                           if previous and previous.get("mode") == "https" and site.is_file() else None)
+        previous_domain = previous.get("domain") if previous and site.is_file() else None
         issue_certificate(config["domain"], config["email"], config["cert"], previous_domain)
         destination = releases / f"{tag}-{secrets.token_hex(4)}"
         files = [CURRENT, auth, panel_path, sudo_path, site, renewal_hook(), SYSCTL,
@@ -699,6 +695,10 @@ def install_project_locked(source, config, *, admin_hash, provenance, previous=N
             atomic_file(site, panel_site(config), 0o644)
             reload_nginx(config["domain"], start_if_inactive=True)
             renewal(activate=True)
+            if not fresh:
+                import nodes
+
+                nodes.sync_installed_nodes()
             run("/usr/bin/sudo", "-u", USER, "--", "/usr/bin/sudo", "-n", "/usr/bin/python3", "-I",
                 f"{CURRENT}/frontend/read_node.py", "status", capture=True)
             for unit in reversed(services):

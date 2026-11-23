@@ -42,13 +42,10 @@ def validate_options(target, fields):
     port = port_value(fields.get("port"))
     email = email_value(fields.get("email"))
     cloudflare = fields.get("cloudflare", False)
-    open_firewall = fields.get("open_firewall", False)
     up_mbps = bandwidth_value(fields.get("up_mbps", 0))
     down_mbps = bandwidth_value(fields.get("down_mbps", 0))
-    if type(cloudflare) is not bool or type(open_firewall) is not bool:
+    if type(cloudflare) is not bool:
         raise ValueError("无效的节点选项。")
-    if open_firewall:
-        raise ValueError("请在 VPS 防火墙和云安全组中放行所需端口。")
     if target == "hy2" and cloudflare:
         raise ValueError("Hysteria 2 使用直连 UDP。请将节点域名设为仅 DNS。")
     if target == "hy2" and bool(up_mbps) != bool(down_mbps):
@@ -60,52 +57,28 @@ def validate_options(target, fields):
             raise ValueError("这个 TCP 端口已预留给 HTTP 验证或本机核心。")
         if cloudflare and port not in CLOUDFLARE_PORTS:
             raise ValueError("Cloudflare HTTPS 代理仅支持 TCP 443、2053、2083、2087、2096、8443。")
-    return dict(domain=domain, port=port, email=email, cloudflare=cloudflare, open_firewall=open_firewall,
+    return dict(domain=domain, port=port, email=email, cloudflare=cloudflare,
                 up_mbps=up_mbps, down_mbps=down_mbps)
 
 
 def _vless_core(internal, secret, path):
+    sockopt = dict(tcpNoDelay=True, tcpFastOpen=True)
     core = dict(
         log=dict(loglevel="warning"),
         inbounds=[dict(listen="127.0.0.1", port=internal, protocol="vless",
                        settings=dict(clients=[dict(id=secret)], decryption="none"),
-                       streamSettings=dict(network="ws", wsSettings=dict(path=path)))],
-        outbounds=[dict(protocol="freedom")],
+                       streamSettings=dict(network="ws", wsSettings=dict(path=path), sockopt=sockopt))],
+        outbounds=[dict(protocol="freedom", streamSettings=dict(sockopt=sockopt))],
     )
     return json.dumps(core, indent=2)
 
 
-def legacy_mappings(target, config):
-    """Frozen v0.1.0-v0.1.3 output snapshot for upgrade conflict checks and key migration; keep covered by tests."""
-    internal, port = config["internal"], config["port"]
-    domain, secret, path = (config[name] for name in ("domain", "secret", "path"))
-    unit = unit_name(target)
-    if target == "hy2":
-        return (
-            f"""listen: ":{internal}"
-tls:
-  cert: /run/credentials/{unit}/tls.crt
-  key: /run/credentials/{unit}/tls.key
-auth:
-  type: password
-  password: "{secret}"
-""",
-            f"hysteria2://{secret}@{domain}:{port}/?sni={domain}#chenniXvpn-HY2",
-            acme_site(domain),
-        )
-    query = urlencode(dict(encryption="none", security="tls", sni=domain, type="ws", host=domain, path=path))
-    site = tls_site(domain, port, config["cert"], f"""location = {path} {{
-        proxy_pass http://127.0.0.1:{internal};
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_read_timeout 300s;
-        proxy_send_timeout 300s;
-    }}
-    location / {{ return 404; }}""")
-    return _vless_core(internal, secret, path), f"vless://{secret}@{domain}:{port}?{query}#chenniXvpn-VLESS", site
+STATE_FIELDS = ("domain", "internal", "secret", "path", "port", "email", "cert", "cloudflare", "up_mbps", "down_mbps")
+
+
+def _state_text(config):
+    return "\n".join(str(config[key]).lower() if type(config[key]) is bool else str(config[key])
+                     for key in STATE_FIELDS) + "\n"
 
 
 def mappings(target, config):
@@ -139,6 +112,8 @@ auth:
         proxy_pass http://127.0.0.1:{internal};
         proxy_http_version 1.1;
         proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_socket_keepalive on;
         proxy_set_header Host $host;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -294,12 +269,10 @@ def inspect_node(target, unit):
             config = None
     if config:
         core, share, site = mappings(target, config)
-        legacy_core, legacy_share, legacy_site = legacy_mappings(target, config)
         expected = dict(core=core, uri=share + "\n", site=site,
                         unit=core_service(target, paths["binary"], paths["core"], config["cert"]))
-        legacy = dict(core=legacy_core, uri=legacy_share + "\n", site=legacy_site, unit=expected["unit"])
         for key, content in expected.items():
-            if key in present and paths[key].read_bytes() not in {content.encode(), legacy[key].encode()}:
+            if key in present and paths[key].read_bytes() != content.encode():
                 conflicts.add(paths[key])
         if "version" in present:
             tag = read_text(paths["version"])
@@ -365,9 +338,7 @@ def configure(operation, target, fields):
     binary, core, version = core_paths(target)
     site, state, pending = (paths[key] for key in ("site", "state", "pending"))
     wire_config, share, site_config = mappings(target, config)
-    changed = "\n".join(str(config[key]) if type(config[key]) is not bool else str(config[key]).lower()
-                        for key in ("domain", "internal", "secret", "path", "port", "email", "cert",
-                                    "cloudflare", "open_firewall", "up_mbps", "down_mbps")) + "\n"
+    changed = _state_text(config)
 
     with tempfile.TemporaryDirectory(prefix="node-", dir=ADMIN) as temp:
         work = Path(temp)
@@ -478,3 +449,59 @@ def upgrade(target, tag):
                 system("restart", name)
             raise
     return f"核心已升级至 {tag}。"
+
+
+def sync_installed_nodes():
+    """Rewrite installed node configs to the current v0.2.0 layout during panel upgrades."""
+    for target in ("hy2", "vless"):
+        if (ETC / f"{target}.state.pending").exists():
+            continue
+        config = node_config(target)
+        if not config:
+            continue
+        paths = node_paths(target)
+        if not all(paths[key].exists() for key in ("binary", "core", "site", "uri", "unit", "state")):
+            continue
+        wire_config, share, site_config = mappings(target, config)
+        unit_text = core_service(target, paths["binary"], paths["core"], config["cert"])
+        state_text = _state_text(config)
+        desired = (
+            ("core", wire_config, 0o600),
+            ("uri", share + "\n", 0o600),
+            ("site", site_config, 0o644),
+            ("unit", unit_text, 0o644),
+            ("state", state_text, 0o600),
+        )
+        updates = [(key, text, mode) for key, text, mode in desired if paths[key].read_bytes() != text.encode()]
+        if not updates:
+            continue
+        name = unit_name(target)
+        was_active = active(name)
+        changed_keys = {key for key, _, _ in updates}
+        with tempfile.TemporaryDirectory(prefix="sync-", dir=ADMIN) as temp:
+            if "core" in changed_keys:
+                candidate_config = Path(temp) / paths["core"].name
+                atomic_file(candidate_config, wire_config)
+                check_candidate(target, paths["binary"], candidate_config)
+            backup = Backup([paths[key] for key, _, _ in updates])
+            try:
+                for key, text, mode in updates:
+                    atomic_file(paths[key], text, mode)
+                if "site" in changed_keys:
+                    reload_nginx(config["domain"], start_if_inactive=False)
+                if "unit" in changed_keys:
+                    system("daemon-reload")
+                if was_active and (changed_keys & {"core", "unit"}):
+                    system("restart", name)
+                if was_active and ((changed_keys & {"core", "unit"}) or (target == "vless" and "site" in changed_keys)):
+                    retry(lambda: healthy(target, config), "节点未通过本机连接检查。")
+            except Exception:
+                backup.restore()
+                if "site" in changed_keys:
+                    reload_nginx(start_if_inactive=False)
+                if "unit" in changed_keys:
+                    system("daemon-reload")
+                if was_active and (changed_keys & {"core", "unit"}):
+                    system("reset-failed", name, check=False)
+                    system("restart", name)
+                raise

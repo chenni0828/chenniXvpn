@@ -177,7 +177,7 @@ class Panel:
         if method == "GET" and len(parts) == 2 and parts[0] == "jobs" and JOB_ID.fullmatch(parts[1]):
             return self.host.operate("job", id=parts[1])
         if method == "POST" and path == "jobs":
-            fields = {"operation", "target", "domain", "port", "email", "cloudflare", "open_firewall",
+            fields = {"operation", "target", "domain", "port", "email", "cloudflare",
                       "up_mbps", "down_mbps", "version", "cert", "release_id"}
             if not body.keys() <= fields:
                 raise HttpError(400, "任务请求含有未知字段")
@@ -211,17 +211,11 @@ class Panel:
                 node["entries"] = {}
                 node["latest"] = None
             vless = next((n for n in result["nodes"] if n["protocol"] == "vless"), None)
-            legacy_key = vless.pop("legacy_key", None) if vless else None
-            migrate = bool(vless and vless.get("key") and legacy_key and legacy_key != vless["key"])
             kinds = []
             sharing_error = None
             try:
                 with self.store.db() as db:
-                    db.execute("BEGIN IMMEDIATE" if migrate else "BEGIN")
-                    if migrate:
-                        db.execute("UPDATE reports SET node=? WHERE node=?", (vless["key"], legacy_key))
-                        db.execute("UPDATE OR IGNORE entries SET node=? WHERE node=?", (vless["key"], legacy_key))
-                        db.execute("DELETE FROM entries WHERE node=?", (legacy_key,))
+                    db.execute("BEGIN")
                     kinds = self.entry_kinds(db)
                     if vless and vless["key"]:
                         reports = self.reports(db, vless["key"], latest=True)
@@ -254,7 +248,6 @@ class Panel:
                     if not row:
                         raise HttpError(404, "报告不存在")
                     view = dict(row)
-                    view["target_verified"] = view["measured_at"] is not None
                     view["rows"] = json.loads(view.pop("rows_json"))
                     view["baseline"] = json.loads(view.pop("baseline_json") or "null")
                     view["diagnosis"] = diagnose_report(view["rows"], view["baseline"])
@@ -273,7 +266,7 @@ class Panel:
                         report = parse_report_with_metadata(content)
                     except (ValueError, csv.Error) as exc:
                         raise HttpError(400, str(exc)) from exc
-                    if report.target_fingerprint is not None and report.target_fingerprint != Node.parse(raw).target_fingerprint():
+                    if report.target_fingerprint != Node.parse(raw).target_fingerprint():
                         raise HttpError(409, "CSV 的测速目标与当前节点不一致，请重新测速")
                     rows = report.rows
                     usable = sum(r["successes"] > 0 for r in rows)
@@ -281,7 +274,7 @@ class Panel:
                                      VALUES(?,?,?,?,?,?,?,?,?)""",
                                      (key, name.strip()[:120], time.time(), len(rows), usable,
                                       rows[0]["median_ms"] if usable else None, json.dumps(rows), report.measured_at,
-                                      json.dumps(report.baseline) if report.baseline is not None else None))
+                                      json.dumps(report.baseline)))
                     return {"id": cur.lastrowid}
         raise HttpError(404, "接口不存在")
 
@@ -304,8 +297,7 @@ class Panel:
         sql += " ORDER BY id DESC"
         if latest:
             sql += " LIMIT 1"
-        return [dict(r, target_verified=r["measured_at"] is not None)
-                for r in db.execute(sql, (key,) if key is not None else ())]
+        return [dict(r) for r in db.execute(sql, (key,) if key is not None else ())]
 
     def raw(self, protocol):
         raw = self.host.read("share", protocol)
@@ -337,11 +329,9 @@ class Panel:
                     report_id = body.get("report")
                     if type(report_id) is not int:
                         raise HttpError(400, "请选择有效报告")
-                    row = db.execute("SELECT rows_json,measured_at FROM reports WHERE node=? AND id=?", (key, report_id)).fetchone()
+                    row = db.execute("SELECT rows_json FROM reports WHERE node=? AND id=?", (key, report_id)).fetchone()
                     if not row:
                         raise HttpError(400, "请选择有效报告")
-                    if row["measured_at"] is None:
-                        raise HttpError(409, "报告的测速目标未验证，请重新测速后再选择优选入口")
                     if not any(r["ip"] == address and r["successes"] for r in json.loads(row["rows_json"])):
                         raise HttpError(400, "请选择报告中握手成功的 IP")
             else:

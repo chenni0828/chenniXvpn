@@ -142,7 +142,7 @@ function latestCheck() {
   const vless=getNode('vless');
   const last=vless?.latest;
   if (!last) return empty(vless?.installed?'当前配置尚无测速报告':'创建并启动 VLESS 后可导入测速报告') + link('nodes/vless/diagnostics','查看测速报告');
-  return stale(nodeError,server.checked_at)+`<div class="kv">${row('检查方式','VLESS 客户端 WebSocket 握手')}${row('测试目标',last.target_verified?'已核对':'目标未验证')}${row('测试时间',date(last.measured_at))}${row('可用地址',last.usable+' / '+last.count)}${row('优选握手',last.best_ms==null?'—':number(last.best_ms)+' ms')}${row('导入时间',date(last.ts))}</div>${link('nodes/vless/diagnostics/'+last.id,'查看报告')}`;
+  return stale(nodeError,server.checked_at)+`<div class="kv">${row('检查方式','VLESS 客户端 WebSocket 握手')}${row('测试时间',date(last.measured_at))}${row('可用地址',last.usable+' / '+last.count)}${row('优选握手',last.best_ms==null?'—':number(last.best_ms)+' ms')}${row('导入时间',date(last.ts))}</div>${link('nodes/vless/diagnostics/'+last.id,'查看报告')}`;
 }
 function overview() {
   const actions=region('node-create',createNodeButton())+btn('refresh','刷新','refresh','ghost');
@@ -243,27 +243,27 @@ function reportTable(report) {
   const stats = [
     {label:'落地机房', value:r=>r.colo?pill(r.colo,'neutral'):'—'},
     {label:'成功率', value:r=>`${number(100*r.successes/r.attempts,1)}% <small>（${r.successes}/${r.attempts}）</small>`},
+    {label:'边缘 TCP', value:r=>r.tcp_ms==null?'—':number(r.tcp_ms)+' ms'},
     {label:'握手中位数', value:r=>r.median_ms==null?'—':number(r.median_ms)+' ms'},
     {label:'Cloudflare 边缘下载', value:r=>r.download_mbps!=null?number(r.download_mbps)+' Mbps':
       r.download_error?`<span class="muted">失败 · ${esc(r.download_error)}</span>`:'未测'},
   ];
-  const canPrefer = report.target_verified;
-  const headings = ['候选 IP', ...stats.map(s=>s.label)];
-  if (canPrefer) headings.push('分享');
+  const headings = ['候选 IP', ...stats.map(s=>s.label), '分享'];
   return `<div class="table-wrap"><table class="table report-table"><thead><tr>
     ${headings.map(label=>`<th scope="col">${label}</th>`).join('')}
     </tr></thead><tbody>${report.rows.map((r,i)=>`<tr>
-      <td class="result-address mono">${esc(r.ip)}${canPrefer && i===0 && r.successes===r.attempts?' '+pill('测速首选','good'):''}${r.error?`<div class="muted">${esc(r.error)}</div>`:''}</td>
+      <td class="result-address mono">${esc(r.ip)}${i===0 && r.successes===r.attempts?' '+pill('测速首选','good'):''}${r.error?`<div class="muted">${esc(r.error)}</div>`:''}</td>
       ${stats.map(s=>`<td class="result-stat" data-label="${s.label}">${s.value(r)}</td>`).join('')}
-      ${canPrefer?`<td class="result-action">${r.successes?btn('prefer','预览','qr','small',`data-ip="${esc(r.ip)}"`):'<span class="muted">不可用</span>'}</td>`:''}
+      <td class="result-action">${r.successes?btn('prefer','预览','qr','small',`data-ip="${esc(r.ip)}"`):'<span class="muted">不可用</span>'}</td>
     </tr>`).join('')}</tbody></table></div>`;
 }
 function reportBaseline(baseline) {
   if(!baseline)return '';
   const colo=baseline.colo?' · 机房 '+esc(baseline.colo):'';
+  const tcp=baseline.tcp_ms==null?'':' · 边缘 TCP '+number(baseline.tcp_ms)+' ms';
   const latency=baseline.median_ms==null?'':' · 握手中位数 '+number(baseline.median_ms)+' ms';
   const failure=baseline.error?' · '+esc(baseline.error):'';
-  return `<p class="muted">原始入口 · ${baseline.successes}/${baseline.attempts} 次握手成功${colo}${latency}${failure}</p>`;
+  return `<p class="muted">原始入口 · ${baseline.successes}/${baseline.attempts} 次握手成功${colo}${tcp}${latency}${failure}</p>`;
 }
 function reportDiagnosis(diagnosis) {
   if(!diagnosis?.length)return '';
@@ -299,7 +299,7 @@ function connectionContent(n) {
   return `<div class="entry-grid ${available.length===2?'entry-pair':''}">${available.map(k=>entryCard(n,k)).join('')}</div>`;
 }
 function reportMeta(r) {
-  return `<span data-report-node="${esc(r.node)}">${reportScope(r.node)}</span> · <span>${r.target_verified?'目标已核对':'目标未验证'}</span>${r.measured_at?` · <span>测试于 ${date(r.measured_at)}</span>`:''} · <span>${date(r.ts)} 导入</span>`;
+  return `<span data-report-node="${esc(r.node)}">${reportScope(r.node)}</span> · <span>测试于 ${date(r.measured_at)}</span> · <span>${date(r.ts)} 导入</span>`;
 }
 function reportScope(key) {
   if(nodeError || !server)return '配置状态待确认';
@@ -347,7 +347,7 @@ async function nodePage(n,seq) {
         report=detail;
         title='报告详情';
         crumbs.push([null,'报告详情']);
-        html=card(report.name,`<p class="report-meta">${reportMeta(report)}<span>${report.usable} / ${report.count} 个地址握手成功</span></p>${reportBaseline(report.baseline)}${reportDiagnosis(report.diagnosis)}<p class="muted">按握手成功率、Cloudflare 边缘下载速度和握手延迟排序。下载只测初筛前列候选，结果不代表 VLESS 实际吞吐量。</p>${region('report-status')}${reportTable(report)}`,
+        html=card(report.name,`<p class="report-meta">${reportMeta(report)}<span>${report.usable} / ${report.count} 个地址握手成功</span></p>${reportBaseline(report.baseline)}${reportDiagnosis(report.diagnosis)}<p class="muted">按握手成功率、回源延迟梯队与边缘下载速度排序。下载只测初筛前列候选，结果不代表 VLESS 实际吞吐量。</p>${region('report-status')}${reportTable(report)}`,
           deleteReportButton(report,'删除报告'));
       }else{
         const reports=await api('reports');

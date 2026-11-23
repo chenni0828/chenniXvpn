@@ -96,7 +96,7 @@ parser.add_argument("--from-github", nargs="?", const="", required=True)
 options, forwarded = parser.parse_known_args()
 tag = options.from_github
 if tag and not re.fullmatch(tag_pattern, tag):
-    raise SystemExit("请输入版本标签，例如 v0.1.0。")
+    raise SystemExit("请输入版本标签，例如 v0.2.0。")
 try:
     ref = f"tags/{tag}" if tag else "latest"
     request = Request(f"https://api.github.com/repos/{project}/releases/{ref}",
@@ -110,8 +110,8 @@ try:
             or release.get("draft") is not False or release.get("prerelease") is not False
             or (tag and published != tag)):
         raise ValueError("GitHub Release 版本无效。")
-    if tuple(map(int, published[1:].split("."))) < (0, 1, 0):
-        raise ValueError("请选择 v0.1.0 或更高版本。")
+    if tuple(map(int, published[1:].split("."))) < (0, 2, 0):
+        raise ValueError("请选择 v0.2.0 或更高版本。")
     asset = next((item for item in release["assets"] if isinstance(item, dict) and item.get("name") == asset_name), {})
     expected_digest = asset.get("digest")
     expected_size = asset.get("size")

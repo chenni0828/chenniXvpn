@@ -24,7 +24,7 @@ TARGETS = ("project", "hy2", "vless")
 RUNNING = {"queued", "running"}
 OPERATIONS = {"create", "configure", "repair", "enable", "disable", "upgrade", "retire_certificate"}
 OPERATIONS.add("delete_release")
-OPTIONAL = {"cloudflare", "open_firewall", "up_mbps", "down_mbps"}
+OPTIONAL = {"cloudflare", "up_mbps", "down_mbps"}
 RELEASE_ID = re.compile(r"(?:app/)?v\d{1,5}\.\d{1,5}\.\d{1,5}(?:\.\d{1,5})?-[0-9a-f]{8}")
 
 

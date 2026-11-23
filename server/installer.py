@@ -23,7 +23,6 @@ def arguments(argv):
     group = parser.add_mutually_exclusive_group()
     for name in ("upgrade", "reconfigure", "status"):
         group.add_argument("--" + name, action="store_true")
-    parser.add_argument("--mode", choices=("https",))
     parser.add_argument("--domain")
     parser.add_argument("--email")
     parser.add_argument("--port", type=int)
@@ -32,7 +31,7 @@ def arguments(argv):
     args, extra = parser.parse_known_args(argv)
     if extra:
         parser.error("存在未知参数，请查看 --help。")
-    access_given = any(getattr(args, key) is not None for key in ("mode", "domain", "email", "port"))
+    access_given = any(getattr(args, key) is not None for key in ("domain", "email", "port"))
     if args.status and (access_given or args.admin_password_stdin or args.dry_run):
         parser.error("--status 是只读查询，不能同时指定部署配置。")
     if args.json and not args.status:
@@ -74,22 +73,14 @@ def installed_state():
     if version:
         version_key(version)
     if config is not None:
-        if not isinstance(config, dict) or config.get("mode") not in ("ssh", "https"):
-            raise ValueError("本机 panel.json 的访问方式无效。")
+        if not isinstance(config, dict):
+            raise ValueError("本机 panel.json 的格式无效。")
         for key in ("port", "local_port"):
             d.port_value(config.get(key))
-        if config["mode"] == "https":
-            domain = d.domain_value(config.get("domain"))
-            d.email_value(config.get("email"))
-            if config.get("cert") != d.node_cert_name("panel", domain):
-                raise ValueError("本机面板证书名称无效。")
-        else:
-            host = config.get("ssh_host")
-            user = config.get("ssh_user")
-            if not isinstance(host, str) or not host or "@" in host or (user is not None and not isinstance(user, str)):
-                raise ValueError("本机 panel.json 的 SSH 目标无效。")
-            if config.get("ssh_port") is not None:
-                d.port_value(config["ssh_port"])
+        domain = d.domain_value(config.get("domain"))
+        d.email_value(config.get("email"))
+        if config.get("cert") != d.node_cert_name("panel", domain):
+            raise ValueError("本机面板证书名称无效。")
     return version, config
 
 
@@ -133,8 +124,8 @@ def status():
         state = "healthy" if healthy else "degraded"
     else:
         state = "incomplete" if owned_files_exist() else "not_installed"
-    return dict(state=state, installed=installed, version=version, mode=config["mode"] if config else None,
-                entry=d.panel_origin(config) if config and config["mode"] == "https" else None,
+    return dict(state=state, installed=installed, version=version,
+                entry=d.panel_origin(config) if config else None,
                 services=services, local_auth=local_auth, public_access="not_checked",
                 source=installed_source(), swap_bytes=swap_bytes())
 
@@ -156,8 +147,6 @@ def print_status(report, as_json=False):
     print(f"部署状态 {report['state']}，版本 {report['version'] or '未知'}。")
     if report["entry"]:
         print_origin(report["entry"])
-    elif report["mode"] == "ssh":
-        print("检测到旧版 SSH 隧道入口。请使用 --reconfigure --mode=https --domain ... --email ... 迁移到公网 HTTPS。")
     print_source(report["source"])
     for name, service in report["services"].items():
         print(f"{name}: active={service['active']} enabled={service['enabled']}")
@@ -177,26 +166,18 @@ def execute(source, args, access_given):
     version_key(tag)
     if not previous and (args.upgrade or args.reconfigure):
         raise ValueError("此主机尚未安装，请先完成首次安装。")
-    legacy_ssh = bool(previous and previous["mode"] == "ssh")
-    if legacy_ssh and not args.reconfigure:
-        raise ValueError("当前部署使用旧版 SSH 隧道入口。请使用 --reconfigure --mode=https --domain 管理域名 "
-                         "--email 证书邮箱 迁移到公网 HTTPS，之后再执行 --upgrade。")
     if previous_version and version_key(tag) < version_key(previous_version):
         raise ValueError(f"当前已安装 {previous_version}，请使用相同或更高版本。")
-    if args.reconfigure and tag != previous_version and not legacy_ssh:
-        raise ValueError(f"请先用本版 --upgrade 从 {previous_version} 升级，再切换访问方式。")
-    full_install = not previous or legacy_ssh
+    if args.reconfigure and tag != previous_version:
+        raise ValueError(f"请先用本版 --upgrade 从 {previous_version} 升级，再切换访问配置。")
 
     tty = sys.stdin.isatty() and not args.non_interactive
     if not previous or args.reconfigure:
         config = access.requested_settings(args, previous, prompt=tty)
     else:
         config = previous
-        if access_given:
-            if args.mode is None:
-                args.mode = previous["mode"]
-            if access.requested_settings(args, previous, prompt=False) != previous:
-                raise ValueError("已有部署的访问配置不同，请使用 --reconfigure。")
+        if access_given and access.requested_settings(args, previous, prompt=False) != previous:
+            raise ValueError("已有部署的访问配置不同，请使用 --reconfigure。")
     if previous_version == tag and config == previous:
         print("已安装相同版本且访问配置相同。")
         with d.deployment_lock(read_only=True):
@@ -207,25 +188,18 @@ def execute(source, args, access_given):
     if not (args.dry_run or tty or args.non_interactive or args.upgrade):
         raise ValueError("无交互终端。请预览并确认后使用 --non-interactive。")
 
-    if args.reconfigure:
-        action = "迁移到公网 HTTPS 并升级" if legacy_ssh and tag != previous_version else \
-            "迁移到公网 HTTPS" if legacy_ssh else "更新公网 HTTPS 配置"
-    else:
-        action = "升级" if previous else "首次安装"
-    info = installed_source() if args.reconfigure and not full_install else source_info(
+    action = "更新公网 HTTPS 配置" if args.reconfigure else ("升级" if previous else "首次安装")
+    info = installed_source() if args.reconfigure else source_info(
         source, tag, os.environ.get("CHENNIXVPN_VERIFIED_ARCHIVE_SHA256"))
     addresses = access.preflight(config, previous) if not previous or args.reconfigure else []
-    print(f"{action} chenniXvpn {tag}，主机 {socket.gethostname()}，模式 {config['mode']}。")
+    print(f"{action} chenniXvpn {tag}，主机 {socket.gethostname()}。")
     print_origin(d.panel_origin(config))
     print_source(info)
     if addresses:
         print(f"本机 DNS 解析 {', '.join(addresses)}。证书邮箱 {config['email']}，"
               f"主机防火墙和云安全组需放行 TCP 80 与 TCP {config['port']}。")
     if args.reconfigure:
-        if legacy_ssh:
-            print("原入口为旧版 SSH 隧道。将切换为公网 HTTPS，保留密码、数据库及节点。")
-        else:
-            print(f"原入口 {d.panel_origin(previous)}。将更新面板服务和相关入口，保留密码、数据库及节点。")
+        print(f"原入口 {d.panel_origin(previous)}。将更新面板服务和相关入口，保留密码、数据库及节点。")
     elif previous:
         print("将备份数据库、替换应用版本并恢复原服务运行状态。")
     else:
@@ -245,7 +219,7 @@ def execute(source, args, access_given):
             raise RuntimeError("预览后部署状态已变化，请重新运行。")
         if prompted and (not previous or args.reconfigure):
             access.preflight(config, previous)
-        if args.reconfigure and not full_install:
+        if args.reconfigure:
             access.reconfigure(previous, config)
         else:
             d.install_project_locked(source, config, admin_hash=admin_hash, provenance=info,
