@@ -49,7 +49,7 @@ TCP_TIMEOUT = 1
 WS_SHORTLIST = 40
 DOWNLOAD_TOP = 10
 DOWNLOAD_TIMEOUT = 10
-DOWNLOAD_BYTES = 200_000_000
+DOWNLOAD_BYTES = 99_999_999
 LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", re.ASCII)
 
 
@@ -416,7 +416,7 @@ def download(result, size, timeout, context, *, timed_sample=False):
 
 def rank_candidate(ip, attempts, successes, median_ms, download_mbps):
     latency = median_ms if median_ms is not None else float("inf")
-    return -successes / attempts, latency, -(download_mbps or 0), ip
+    return -successes / attempts, download_mbps is None, -(download_mbps or 0), latency, ip
 
 
 def rank(result):
@@ -454,13 +454,6 @@ def write_csv(path, results, node, measured_at, baseline=None):
                 f"{100 * (1 - result.successes / result.attempts):.1f}",
                 result.median_ms, result.mbps, result.error, result.download_error, *metadata, *comparison,
             ])
-
-
-def write_tcp_csv(path, results):
-    with output_file(path, "utf-8-sig", "") as out:
-        rows = csv.writer(out)
-        rows.writerow(("ip", "attempts", "successes", "average_ms", "error"))
-        rows.writerows((r.ip, r.attempts, r.successes, r.average_ms, r.error) for r in results)
 
 
 def write_links(path, links):
@@ -519,18 +512,15 @@ def test_task(args, task):
         raise ValueError("候选列表为空或与所选的 IP 版本不匹配")
     started = datetime.now()
     run_name = f"cf-{started:%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:12]}"
-    tcp_file = directory / (run_name + "-tcp.csv")
     report_file = directory / (run_name + "-report.csv")
 
     print(f"TCP 初筛 {len(addresses)} 个地址，每个地址连接 {args.attempts} 次，{args.workers} 并发。", flush=True)
     tcp_results = measure_many(addresses, args.workers, lambda ip: tcp_probe(ip, task.port, args.attempts), "TCP 初筛")
     tcp_results.sort(key=lambda r: (-r.successes, r.average_ms if r.average_ms is not None else float("inf"), r.ip))
-    write_tcp_csv(tcp_file, tcp_results)
-    print(f"完整初筛：{tcp_file}", flush=True)
 
     shortlist = [r.ip for r in tcp_results[:WS_SHORTLIST] if r.successes]
     if not shortlist:
-        print("没有地址通过 TCP 初筛，请查看初筛文件。", file=sys.stderr)
+        print("没有地址通过 TCP 初筛，请检查网络和节点端口后重试。", file=sys.stderr)
         return 1
     context = ssl.create_default_context()
     print(f"复测原始入口和 {len(shortlist)} 个候选。", flush=True)

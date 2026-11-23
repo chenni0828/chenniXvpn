@@ -244,7 +244,7 @@ function reportTable(report) {
   return `<div class="table-wrap"><table class="table report-table"><thead><tr>
     ${headings.map(label=>`<th scope="col">${label}</th>`).join('')}
     </tr></thead><tbody>${report.rows.map((r,i)=>`<tr>
-      <td class="result-address mono">${esc(r.ip)}${canPrefer && i===0 && r.successes===r.attempts?' '+pill('推荐','good'):''}${r.error?`<div class="muted">${esc(r.error)}</div>`:''}</td>
+      <td class="result-address mono">${esc(r.ip)}${canPrefer && i===0 && r.successes===r.attempts?' '+pill('测速首选','good'):''}${r.error?`<div class="muted">${esc(r.error)}</div>`:''}</td>
       ${stats.map(s=>`<td class="result-stat" data-label="${s.label}">${s.value(r)}</td>`).join('')}
       ${canPrefer?`<td class="result-action">${r.successes?btn('prefer','预览','qr','small',`data-ip="${esc(r.ip)}"`):'<span class="muted">不可用</span>'}</td>`:''}
     </tr>`).join('')}</tbody></table></div>`;
@@ -333,7 +333,7 @@ async function nodePage(n,seq) {
         report=detail;
         title='报告详情';
         crumbs.push([null,'报告详情']);
-        html=card(report.name,`<p class="report-meta">${reportMeta(report)}<span>${report.usable} / ${report.count} 个地址握手成功</span></p>${reportBaseline(report.baseline)}${region('report-status')}${reportTable(report)}`,
+        html=card(report.name,`<p class="report-meta">${reportMeta(report)}<span>${report.usable} / ${report.count} 个地址握手成功</span></p>${reportBaseline(report.baseline)}<p class="muted">按握手成功率、Cloudflare 边缘下载速度和握手延迟排序。下载只测初筛前列候选，结果不代表 VLESS 实际吞吐量。</p>${region('report-status')}${reportTable(report)}`,
           deleteReportButton(report,'删除报告'));
       }else{
         const reports=await api('reports');
