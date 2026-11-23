@@ -468,6 +468,7 @@ textarea:focus-visible {
 .dialog-body { padding: 1.2rem 1.25rem; }
 .dialog-body form { display: grid; grid-template-columns: minmax(0, 1fr); justify-items: start; gap: 1rem; }
 .dialog-body form > .field { width: 100%; }
+#hy2-bandwidth:not([hidden]) { display: grid; gap: 1rem; width: 100%; }
 .dialog-body p { font-size: .875rem; }
 .dialog-actions { flex-wrap: wrap; justify-content: flex-end; gap: .6rem; padding: .85rem 1.25rem 1.1rem; border-top: 1px solid var(--soft-line); }
 .field { display: grid; min-width: 0; gap: .35rem; color: var(--subtle); font-size: .9rem; font-weight: 590; }

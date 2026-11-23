@@ -37,7 +37,7 @@ def release(target, tag=None):
     request = Request(f"https://api.github.com/repos/{REPOSITORIES[target]}/releases/{reference}",
                       headers={"Accept": "application/vnd.github+json", "User-Agent": "chennixvpn"})
     try:
-        with urlopen(request, timeout=7) as response:
+        with urlopen(request, timeout=15) as response:
             data = json.loads(response.read(2 * 1024**2 + 1))
     except HTTPError as exc:
         if exc.code == 404 and target == "project":
@@ -67,7 +67,7 @@ def download_asset(data, asset_name, output):
     result = hashlib.sha256()
     total = 0
     try:
-        with urlopen(Request(url, headers={"User-Agent": "chennixvpn"}), timeout=20) as response, output.open("xb") as file:
+        with urlopen(Request(url, headers={"User-Agent": "chennixvpn"}), timeout=30) as response, output.open("xb") as file:
             final = urlsplit(response.url)
             if final.scheme != "https" or final.hostname not in {"github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"}:
                 raise RuntimeError("GitHub 下载地址无效。")

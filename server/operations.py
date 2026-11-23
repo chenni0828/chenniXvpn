@@ -24,7 +24,7 @@ TARGETS = ("project", "hy2", "vless")
 RUNNING = {"queued", "running"}
 OPERATIONS = {"create", "configure", "repair", "enable", "disable", "upgrade", "retire_certificate"}
 OPERATIONS.add("delete_release")
-OPTIONAL = {"cloudflare", "open_firewall"}
+OPTIONAL = {"cloudflare", "open_firewall", "up_mbps", "down_mbps"}
 RELEASE_ID = re.compile(r"(?:app/)?v\d{1,5}\.\d{1,5}\.\d{1,5}(?:\.\d{1,5})?-[0-9a-f]{8}")
 
 
@@ -317,8 +317,6 @@ def work(job_id):
         os.umask(0o022)
         if job["target"] == "project" and job["operation"] == "upgrade":
             message = execute(job)
-        elif job["operation"] == "delete_release" and not job.get("current_delete"):
-            return run_current_delete(job)
         else:
             with deploy.deployment_lock():
                 message = execute(job)
@@ -332,18 +330,6 @@ def work(job_id):
         job_write(dict(job, state="failed", message="操作失败，请查看 chennixvpn-operation.service 的系统日志。"))
         raise
     job_write(dict(job, state="succeeded", message=message))
-    return 0
-
-
-def run_current_delete(job):
-    job_write(dict(job, current_delete=True))
-    try:
-        deploy.run(sys.executable, "-I", deploy.CURRENT / "server/operations.py", "--run", job["id"])
-    except RuntimeError:
-        saved = job_read(job["id"])
-        if saved["state"] == "failed":
-            raise RuntimeError(saved["message"]) from None
-        raise
     return 0
 
 

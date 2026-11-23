@@ -31,6 +31,15 @@ RUN = Path("/run/chennixvpn")
 UNITS = Path("/etc/systemd/system")
 NGINX = Path("/etc/nginx/conf.d")
 LETSENCRYPT = Path("/etc/letsencrypt")
+SYSCTL = Path("/etc/sysctl.d/99-chennixvpn.conf")
+SYSCTL_CONFIG = """# Managed by chenniXvpn
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+"""
 WEBROOT = ADMIN / "acme"
 PANEL = "chennixvpn-panel.service"
 TRAFFIC = "chennixvpn-traffic.service"
@@ -68,6 +77,8 @@ def enabled(unit):
 def validate_platform():
     if os.name != "posix" or os.geteuid() != 0 or not Path("/run/systemd/system").is_dir():
         raise RuntimeError("请在运行 systemd 的 Linux 主机上以 root 身份执行。")
+    if os.environ.get("CHENNIXVPN_PLATFORM_VALIDATED") == "1":
+        return
     values = dict(line.split("=", 1) for line in Path("/etc/os-release").read_text().splitlines() if "=" in line)
     distro, version = (values.get(field, "").strip('"') for field in ("ID", "VERSION_ID"))
     minimum = {"debian": "12", "ubuntu": "22.04"}.get(distro)
@@ -75,6 +86,7 @@ def validate_platform():
         raise RuntimeError("系统需要 Debian 12+ 或 Ubuntu 22.04+。")
     if platform.machine() not in ("x86_64", "aarch64"):
         raise RuntimeError("服务端支持 amd64 和 arm64。")
+    os.environ["CHENNIXVPN_PLATFORM_VALIDATED"] = "1"
 
 
 @contextmanager
@@ -128,19 +140,6 @@ class Backup:
                 self.files[path] = ("absent",)
             else:
                 raise RuntimeError(f"无法备份 {path}。")
-
-    def persist(self, directory, states):
-        manifest = {}
-        for index, (path, (kind, *payload)) in enumerate(self.files.items()):
-            entry = {"type": kind}
-            if kind == "file":
-                name = f"file-{index}"
-                atomic_file(directory / name, payload[0])
-                entry.update(file=name, mode=payload[1])
-            elif kind == "symlink":
-                entry["target"] = str(payload[0])
-            manifest[str(path)] = entry
-        atomic_file(directory / "manifest.json", json.dumps({"files": manifest, "services": states}, indent=2))
 
     def restore(self):
         errors = []
@@ -201,6 +200,22 @@ def port_value(value):
     return value
 
 
+def bandwidth_value(value):
+    if value is None or value == 0:
+        return 0
+    if type(value) is not int or not 1 <= value <= 10000:
+        raise ValueError("带宽范围为 1–10000 Mbps（0 表示不限制）。")
+    return value
+
+
+def apply_network_tuning():
+    if read_text(SYSCTL) == SYSCTL_CONFIG.strip():
+        return
+    SYSCTL.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    atomic_file(SYSCTL, SYSCTL_CONFIG, 0o644)
+    run("sysctl", "--system", check=False, capture=True)
+
+
 def read_text(path, default=""):
     try:
         return path.read_text(encoding="utf-8").strip()
@@ -228,8 +243,19 @@ def node_config(target, pending=False):
     try:
         if not trusted_file(record, private=True) or record.stat().st_size > 4096:
             raise ValueError
-        domain, internal, secret, path, public, email, cert, cloudflare, firewall = record.read_text().splitlines()
+        lines = record.read_text().splitlines()
+        if len(lines) == 9:
+            domain, internal, secret, path, public, email, cert, cloudflare, firewall = lines
+            up_text, down_text = "0", "0"
+        elif len(lines) == 11:
+            domain, internal, secret, path, public, email, cert, cloudflare, firewall, up_text, down_text = lines
+        else:
+            raise ValueError
         port = port_value(int(public))
+        up_mbps = bandwidth_value(int(up_text))
+        down_mbps = bandwidth_value(int(down_text))
+        if (target == "vless" and (up_mbps or down_mbps)) or bool(up_mbps) != bool(down_mbps):
+            raise ValueError
         valid_secret = r"[0-9a-f]{48}" if target == "hy2" else r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}"
         if (domain != domain_value(domain) or cert != node_cert_name(target, domain)
                 or int(internal) != (port if target == "hy2" else VLESS_LOOPBACK)
@@ -238,7 +264,8 @@ def node_config(target, pending=False):
                 or cloudflare not in ("true", "false") or firewall != "false"):
             raise ValueError
         return dict(domain=domain, internal=int(internal), secret=secret, path=path, port=port,
-                    email=email_value(email), cert=cert, cloudflare=cloudflare == "true", open_firewall=False)
+                    email=email_value(email), cert=cert, cloudflare=cloudflare == "true", open_firewall=False,
+                    up_mbps=up_mbps, down_mbps=down_mbps)
     except FileNotFoundError:
         return None
     except (OSError, ValueError):
@@ -391,9 +418,9 @@ def issue_certificate(domain, email, cert, previous_domain):
 
 
 def panel_origin(config):
+    if config.get("mode") != "https":
+        raise ValueError("管理面板只支持公网 HTTPS。")
     port = config["port"]
-    if config["mode"] == "ssh":
-        return f"http://127.0.0.1:{port}"
     return "https://" + config["domain"] + (f":{port}" if port != 443 else "")
 
 
@@ -556,8 +583,9 @@ def copy_project(source, destination):
 
 
 def panel_response(config, *, verify_tls=True):
-    domain = config["domain"] if config["mode"] == "https" else None
-    port = config["port"]
+    https = config.get("mode") == "https"
+    domain = config["domain"] if https else None
+    port = config["port"] if https else config["local_port"]
     host = f"{domain}:{port}" if domain and port != 443 else domain
     response, connection = local_http(port, "/api/nodes", domain, {"Host": host} if host else None,
                                       verify_tls=verify_tls)
@@ -597,17 +625,15 @@ def restore_panel_services(states):
             system("stop", unit)
 
 
-def install_project_locked(source, config, *, admin_hash, provenance):
+def install_project_locked(source, config, *, admin_hash, provenance, previous=None):
     tag = read_text(source / "VERSION")
     fresh = admin_hash is not None
     print("正在检查并安装系统依赖。", file=sys.stderr, flush=True)
+    had_ss = bool(shutil.which("ss", path=ENV["PATH"]))
     packages("python3", "gunicorn", "sudo", "ca-certificates", "openssl", "iproute2")
-    https = config["mode"] == "https"
-    if fresh and https:
-        check_ingress(config)
-    use_certbot = https or renewal_hook().exists() or any(ETC.glob("*.state"))
-    if use_certbot:
-        packages("nginx", "certbot")
+    if not had_ss and (fresh or (previous and previous.get("mode") == "ssh")):
+        check_ingress(config, previous)
+    packages("nginx", "certbot")
     if run("id", USER, check=False, capture=True).returncode:
         run("useradd", "--system", "--user-group", "--no-create-home", "--shell", "/usr/sbin/nologin", USER)
     ETC.mkdir(mode=0o700, exist_ok=True)
@@ -620,7 +646,7 @@ def install_project_locked(source, config, *, admin_hash, provenance):
     auth = ETC / "admin.hash"
     site = NGINX / "chennixvpn-panel.conf"
     services = (PANEL, TRAFFIC)
-    states = {unit: (active(unit), enabled(unit)) for unit in services}
+    states = {unit: (active(unit), enabled(unit)) for unit in (*services, "nginx.service", "certbot.timer")}
 
     with tempfile.TemporaryDirectory(prefix="stage-", dir=releases) as temp:
         work = Path(temp)
@@ -639,15 +665,13 @@ def install_project_locked(source, config, *, admin_hash, provenance):
         atomic_file(candidate_rule, sudo_rules(), 0o440)
         run("visudo", "-cf", candidate_rule)
 
-        if fresh and https:
-            print("正在验证 HTTPS 证书。", file=sys.stderr, flush=True)
-            issue_certificate(config["domain"], config["email"], config["cert"], None)
+        print("正在验证 HTTPS 证书。", file=sys.stderr, flush=True)
+        previous_domain = (previous.get("domain")
+                           if previous and previous.get("mode") == "https" and site.is_file() else None)
+        issue_certificate(config["domain"], config["email"], config["cert"], previous_domain)
         destination = releases / f"{tag}-{secrets.token_hex(4)}"
-        files = [CURRENT, auth, panel_path, sudo_path, *(UNITS / unit for unit in services)]
-        if https:
-            files.append(site)
-        if use_certbot:
-            files.append(renewal_hook())
+        files = [CURRENT, auth, panel_path, sudo_path, site, renewal_hook(), SYSCTL,
+                 *(UNITS / unit for unit in services)]
         backup = Backup(files)
         staged.rename(destination)
         recovery = None
@@ -657,26 +681,24 @@ def install_project_locked(source, config, *, admin_hash, provenance):
             print("正在部署并检查面板和流量采集服务。", file=sys.stderr, flush=True)
             if not fresh:
                 recovery = Path(tempfile.mkdtemp(prefix="rollback-", dir=ADMIN))
-                backup.persist(recovery, states)
                 for unit in services:
                     if states[unit][0]:
                         system("stop", unit)
                 database_backup("save", helper, recovery / "panel.sqlite3")
                 database_saved = True
             changed = True
+            apply_network_tuning()
             if fresh:
                 atomic_file(auth, candidate_auth.read_bytes())
-                atomic_file(panel_path, json.dumps(config))
+            atomic_file(panel_path, json.dumps(config))
             atomic_file(sudo_path, candidate_rule.read_bytes(), 0o440)
             atomic_file(UNITS / PANEL, panel_service(config), 0o644)
             atomic_file(UNITS / TRAFFIC, traffic_service(), 0o644)
             set_symlink(CURRENT, destination)
             system("daemon-reload")
-            if https:
-                atomic_file(site, panel_site(config), 0o644)
-                reload_nginx(config["domain"], start_if_inactive=fresh)
-            if use_certbot:
-                renewal(activate=fresh)
+            atomic_file(site, panel_site(config), 0o644)
+            reload_nginx(config["domain"], start_if_inactive=True)
+            renewal(activate=True)
             run("/usr/bin/sudo", "-u", USER, "--", "/usr/bin/sudo", "-n", "/usr/bin/python3", "-I",
                 f"{CURRENT}/frontend/read_node.py", "status", capture=True)
             for unit in reversed(services):
@@ -687,27 +709,22 @@ def install_project_locked(source, config, *, admin_hash, provenance):
             if fresh or states[TRAFFIC][0]:
                 retry(lambda: active(TRAFFIC), "流量采集服务未启动。")
             if fresh or states[PANEL][0]:
-                retry(lambda: check_panel(config), "面板未通过本机 HTTP 检查。")
+                retry(lambda: check_panel(config), "面板未通过本机 HTTPS 认证检查。")
         except (Exception, KeyboardInterrupt) as original:
             try:
                 if changed:
-                    for unit in services:
-                        if fresh:
-                            system("disable", "--now", unit, check=False)
-                        else:
-                            system("stop", unit)
                     backup.restore()
+                    run("sysctl", "--system", check=False, capture=True)
                     if database_saved:
                         database_backup("restore", helper, recovery / "panel.sqlite3")
                     system("daemon-reload")
-                    if https:
-                        reload_nginx(start_if_inactive=False)
-                if not fresh:
-                    restore_panel_services(states)
-                    if states[PANEL][0]:
-                        retry(lambda: check_panel(config), "旧版面板恢复后未通过 HTTP 检查。")
-                    if states[TRAFFIC][0]:
-                        retry(lambda: active(TRAFFIC), "旧版采集服务恢复失败。")
+                restore_panel_services(states)
+                if states["nginx.service"][0]:
+                    reload_nginx(start_if_inactive=False)
+                if states[PANEL][0]:
+                    retry(lambda: check_panel(previous or config), "旧版面板恢复后未通过认证检查。")
+                if states[TRAFFIC][0]:
+                    retry(lambda: active(TRAFFIC), "旧版采集服务恢复失败。")
             except Exception as restore_error:
                 if recovery:
                     raise RuntimeError(f"升级失败且回滚未完成，恢复目录：{recovery}。"
@@ -723,7 +740,7 @@ def install_project_locked(source, config, *, admin_hash, provenance):
 
 def run_package(source, upgrade=False, release_sha256=None):
     args = ["--upgrade"] if upgrade else []
-    env = dict(ENV)
+    env = dict(ENV, CHENNIXVPN_PLATFORM_VALIDATED="1")
     if release_sha256:
         env["CHENNIXVPN_VERIFIED_ARCHIVE_SHA256"] = release_sha256
     run(sys.executable, "-IB", source / "server/deployment.py", *args, env=env, timeout=None, capture=upgrade)

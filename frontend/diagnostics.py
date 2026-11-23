@@ -5,7 +5,7 @@ import math
 import re
 from dataclasses import dataclass
 
-from client.cf_speedtest import REPORT_VERSION, rank_candidate
+from client.cf_speedtest import REPORT_VERSION, diagnose_report, rank_candidate
 
 
 METADATA = {"report_version", "target_fingerprint", "measured_at"}
@@ -18,6 +18,14 @@ class Report:
     target_fingerprint: str | None
     measured_at: int | None
     baseline: dict | None = None
+    diagnosis: list[str] | None = None
+
+
+def colo_value(text):
+    value = (text or "").strip().upper()
+    if value and not re.fullmatch(r"[A-Z]{3}", value):
+        raise ValueError
+    return value
 
 
 def parse_report(text):
@@ -54,6 +62,7 @@ def parse_report_with_metadata(text):
     for row in reader:
         try:
             ip = str(ipaddress.ip_address(row["ip"]))
+            colo = colo_value(row.get("colo"))
             attempts, ok, ms = measurement(row["attempts"], row["successes"], row["median_ms"])
             if None in row or ip in seen or "%" in ip or row["download_mbps"] is None:
                 raise ValueError
@@ -77,15 +86,16 @@ def parse_report_with_metadata(text):
                     row["baseline_attempts"], row["baseline_successes"], row["baseline_median_ms"])
                 if row["baseline_error"] is None:
                     raise ValueError
+                baseline_colo = colo_value(row.get("baseline_colo"))
             except (ValueError, TypeError):
                 raise ValueError(f"CSV 第 {reader.line_num} 行原始入口对照无效") from None
             original = dict(attempts=original_attempts, successes=original_successes, median_ms=original_ms,
-                            error=row["baseline_error"])
+                            error=row["baseline_error"], colo=baseline_colo)
             if baseline is not None and baseline != original:
                 raise ValueError("同一份 CSV 的原始入口对照须一致")
             baseline = original
         seen.add(ip)
-        rows.append(dict(ip=ip, attempts=attempts, successes=ok, median_ms=ms, download_mbps=speed,
+        rows.append(dict(ip=ip, colo=colo, attempts=attempts, successes=ok, median_ms=ms, download_mbps=speed,
                          error=(row.get("error") or "")[:200], download_error=(row.get("download_error") or "")[:200]))
         if len(rows) > 4096:
             raise ValueError("每份报告最多支持 4096 行")
@@ -94,4 +104,4 @@ def parse_report_with_metadata(text):
     rows.sort(key=lambda r: rank_candidate(r["ip"], r["attempts"], r["successes"], r["median_ms"], r["download_mbps"]))
     if baseline is not None:
         baseline["error"] = baseline["error"][:200]
-    return Report(rows, *(metadata or (None, None)), baseline=baseline)
+    return Report(rows, *(metadata or (None, None)), baseline=baseline, diagnosis=diagnose_report(rows, baseline))

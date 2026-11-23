@@ -11,10 +11,11 @@ import zipfile
 from pathlib import Path
 from urllib.parse import urlencode
 
-from deployment import (ADMIN, ETC, LETSENCRYPT, NGINX, UNITS, VLESS_LOOPBACK, Backup, acme_site, active,
-                        atomic_file, domain_value, email_value, enabled, issue_certificate, local_http,
-                        node_cert_name, node_config, packages, port_value, read_text, reload_nginx, renewal,
-                        retry, run, settings, system, tls_site, trusted_file, validate_new_domain)
+from deployment import (ADMIN, ETC, LETSENCRYPT, NGINX, SYSCTL, UNITS, VLESS_LOOPBACK, Backup, acme_site,
+                        active, apply_network_tuning, atomic_file, bandwidth_value, domain_value, email_value,
+                        enabled, issue_certificate, local_http, node_cert_name, node_config, packages, port_value,
+                        read_text, reload_nginx, renewal, retry, run, settings, system, tls_site, trusted_file,
+                        validate_new_domain)
 from releases import core_asset, download_asset, release, version_key
 
 
@@ -42,21 +43,40 @@ def validate_options(target, fields):
     email = email_value(fields.get("email"))
     cloudflare = fields.get("cloudflare", False)
     open_firewall = fields.get("open_firewall", False)
+    up_mbps = bandwidth_value(fields.get("up_mbps", 0))
+    down_mbps = bandwidth_value(fields.get("down_mbps", 0))
     if type(cloudflare) is not bool or type(open_firewall) is not bool:
         raise ValueError("无效的节点选项。")
     if open_firewall:
         raise ValueError("请在 VPS 防火墙和云安全组中放行所需端口。")
     if target == "hy2" and cloudflare:
         raise ValueError("Hysteria 2 使用直连 UDP。请将节点域名设为仅 DNS。")
+    if target == "hy2" and bool(up_mbps) != bool(down_mbps):
+        raise ValueError("配置 Hysteria 2 Brutal 带宽时，需同时填写上行和下行带宽。")
     if target == "vless":
+        if up_mbps or down_mbps:
+            raise ValueError("VLESS 节点不支持带宽限制参数。")
         if port in {80, VLESS_LOOPBACK}:
             raise ValueError("这个 TCP 端口已预留给 HTTP 验证或本机核心。")
         if cloudflare and port not in CLOUDFLARE_PORTS:
             raise ValueError("Cloudflare HTTPS 代理仅支持 TCP 443、2053、2083、2087、2096、8443。")
-    return dict(domain=domain, port=port, email=email, cloudflare=cloudflare, open_firewall=open_firewall)
+    return dict(domain=domain, port=port, email=email, cloudflare=cloudflare, open_firewall=open_firewall,
+                up_mbps=up_mbps, down_mbps=down_mbps)
 
 
-def mappings(target, config):
+def _vless_core(internal, secret, path):
+    core = dict(
+        log=dict(loglevel="warning"),
+        inbounds=[dict(listen="127.0.0.1", port=internal, protocol="vless",
+                       settings=dict(clients=[dict(id=secret)], decryption="none"),
+                       streamSettings=dict(network="ws", wsSettings=dict(path=path)))],
+        outbounds=[dict(protocol="freedom")],
+    )
+    return json.dumps(core, indent=2)
+
+
+def legacy_mappings(target, config):
+    """Frozen v0.1.0-v0.1.3 output snapshot for upgrade conflict checks and key migration; keep covered by tests."""
     internal, port = config["internal"], config["port"]
     domain, secret, path = (config[name] for name in ("domain", "secret", "path"))
     unit = unit_name(target)
@@ -73,13 +93,6 @@ auth:
             f"hysteria2://{secret}@{domain}:{port}/?sni={domain}#chenniXvpn-HY2",
             acme_site(domain),
         )
-    core = dict(
-        log=dict(loglevel="warning"),
-        inbounds=[dict(listen="127.0.0.1", port=internal, protocol="vless",
-                       settings=dict(clients=[dict(id=secret)], decryption="none"),
-                       streamSettings=dict(network="ws", wsSettings=dict(path=path)))],
-        outbounds=[dict(protocol="freedom")],
-    )
     query = urlencode(dict(encryption="none", security="tls", sni=domain, type="ws", host=domain, path=path))
     site = tls_site(domain, port, config["cert"], f"""location = {path} {{
         proxy_pass http://127.0.0.1:{internal};
@@ -92,7 +105,49 @@ auth:
         proxy_send_timeout 300s;
     }}
     location / {{ return 404; }}""")
-    return json.dumps(core, indent=2), f"vless://{secret}@{domain}:{port}?{query}#chenniXvpn-VLESS", site
+    return _vless_core(internal, secret, path), f"vless://{secret}@{domain}:{port}?{query}#chenniXvpn-VLESS", site
+
+
+def mappings(target, config):
+    internal, port = config["internal"], config["port"]
+    domain, secret, path = (config[name] for name in ("domain", "secret", "path"))
+    unit = unit_name(target)
+    if target == "hy2":
+        up_mbps, down_mbps = config.get("up_mbps", 0), config.get("down_mbps", 0)
+        bandwidth_yaml = f"bandwidth:\n  up: {up_mbps} mbps\n  down: {down_mbps} mbps\n" if up_mbps and down_mbps else ""
+        return (
+            f"""listen: ":{internal}"
+tls:
+  cert: /run/credentials/{unit}/tls.crt
+  key: /run/credentials/{unit}/tls.key
+auth:
+  type: password
+  password: "{secret}"
+{bandwidth_yaml}masquerade:
+  type: proxy
+  proxy:
+    url: http://127.0.0.1:80
+    rewriteHost: true
+""",
+            f"hysteria2://{secret}@{domain}:{port}/?sni={domain}#chenniXvpn-HY2",
+            acme_site(domain),
+        )
+    query = urlencode(dict(encryption="none", security="tls", sni=domain, alpn="http/1.1", fp="chrome",
+                           type="ws", host=domain, path=f"{path}?ed=2048"))
+    site = tls_site(domain, port, config["cert"], f"""location = {path} {{
+        if ($http_upgrade !~* "^websocket$") {{ return 404; }}
+        proxy_pass http://127.0.0.1:{internal};
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        proxy_set_header Host $host;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }}
+    location / {{ return 404; }}""")
+    return _vless_core(internal, secret, path), f"vless://{secret}@{domain}:{port}?{query}#chenniXvpn-VLESS", site
 
 
 def core_service(target, binary, path, cert):
@@ -191,7 +246,7 @@ def node_paths(target):
 
 def obsolete_certificates():
     panel = settings() or {}
-    configured = {panel["cert"]} if panel.get("mode") == "https" else set()
+    configured = {panel["cert"]} if panel.get("cert") else set()
     for target in ("hy2", "vless"):
         for pending in (False, True):
             try:
@@ -239,10 +294,12 @@ def inspect_node(target, unit):
             config = None
     if config:
         core, share, site = mappings(target, config)
+        legacy_core, legacy_share, legacy_site = legacy_mappings(target, config)
         expected = dict(core=core, uri=share + "\n", site=site,
                         unit=core_service(target, paths["binary"], paths["core"], config["cert"]))
+        legacy = dict(core=legacy_core, uri=legacy_share + "\n", site=legacy_site, unit=expected["unit"])
         for key, content in expected.items():
-            if key in present and paths[key].read_bytes() != content.encode():
+            if key in present and paths[key].read_bytes() not in {content.encode(), legacy[key].encode()}:
                 conflicts.add(paths[key])
         if "version" in present:
             tag = read_text(paths["version"])
@@ -310,7 +367,7 @@ def configure(operation, target, fields):
     wire_config, share, site_config = mappings(target, config)
     changed = "\n".join(str(config[key]) if type(config[key]) is not bool else str(config[key]).lower()
                         for key in ("domain", "internal", "secret", "path", "port", "email", "cert",
-                                    "cloudflare", "open_firewall")) + "\n"
+                                    "cloudflare", "open_firewall", "up_mbps", "down_mbps")) + "\n"
 
     with tempfile.TemporaryDirectory(prefix="node-", dir=ADMIN) as temp:
         work = Path(temp)
@@ -324,7 +381,7 @@ def configure(operation, target, fields):
         candidate_config = work / core.name
         atomic_file(candidate_config, wire_config)
         check_candidate(target, candidate, candidate_config)
-        backup = Backup(paths.values())
+        backup = Backup([*paths.values(), SYSCTL])
         start = fresh or repairing or was_active
         attempted = False
         changed_site = False
@@ -336,6 +393,7 @@ def configure(operation, target, fields):
             atomic_file(site, site_config, 0o644)
             changed_site = True
             reload_nginx(domain)
+            apply_network_tuning()
             if candidate != binary:
                 atomic_file(version, tag + "\n")
                 atomic_file(binary, candidate.read_bytes(), 0o755)
@@ -360,6 +418,7 @@ def configure(operation, target, fields):
             if (fresh or repairing) and not was_enabled:
                 system("disable", name, check=False)
             backup.restore()
+            run("sysctl", "--system", check=False, capture=True)
             system("daemon-reload")
             if changed_site:
                 reload_nginx()

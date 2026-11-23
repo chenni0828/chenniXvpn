@@ -200,15 +200,19 @@ function nodeTabs(n,section) {
   return tabs(list);
 }
 const diagnosticsReady = node => Boolean(!nodeError && node?.key && node.state==='active');
-function clientTools() {
+function clientTools(n) {
   const links = [
     ['windows', 'Windows EXE · x64'],
     ['linux', 'Linux Python 脚本']
   ].filter(([platform]) => server?.downloads?.[platform]);
   const buttons = links.map(([platform, title]) =>
     `<a class="btn" href="${esc(server.downloads[platform])}" target="_blank" rel="noopener noreferrer">${icon('download')}${title}</a>`).join('');
+  const proxyNote = n && !n.cloudflare
+    ? '<p class="node-change-note">当前节点尚未勾选“使用 Cloudflare 代理”。请确认端口为受支持的 Cloudflare HTTPS 端口，并在 Cloudflare 控制台开启橙色云。</p>'
+    : '';
   return card('客户端测速',`
-    <p class="muted">下载当前节点的测速任务，在日常使用节点的网络运行客户端。</p>
+    ${proxyNote}
+    <p class="muted">下载当前节点的测速任务，在日常使用节点的网络运行客户端（测速前请先关闭本地代理与 TUN 模式）。</p>
     <div class="client-downloads" aria-label="下载客户端">${buttons || '<span class="muted">当前版本的下载链接暂不可用</span>'}</div>
     <p class="muted">Windows 双击 EXE 后选择任务文件，结果保存在 EXE 旁边。</p>
     <p class="muted">Linux 运行 <code>python3 chennixvpn-cloudflare-linux.py test --task chennixvpn-cf-task.json</code>。</p>
@@ -230,10 +234,14 @@ function entryCard(n,kind) {
   const addr=kind==='original'?n.domain:n.entries[kind];
   const action=kind==='manual'?btn('manual','填写地址','edit','small'):kind==='preferred'?link('nodes/vless/diagnostics','选择 IP'):'';
   const buttons=addr&&n.key?btn('share','链接与二维码','qr','',`data-kind="${kind}"`):'';
-  return card(kinds[kind],`<div class="kv">${row('连接地址',esc(addr||'尚未设置'))}${row('端口',n.port??'—')}</div>${buttons}`,action);
+  const hy2Note=n.protocol==='hy2' && n.up_mbps && n.down_mbps
+    ? `<p class="muted">服务端已设 Brutal 带宽（上行 ${n.up_mbps} / 下行 ${n.down_mbps} Mbps）。Hysteria 2 分享链接不含带宽参数，开启 Brutal 需同时在客户端本地配置中填写上下行带宽。</p>`
+    : '';
+  return card(kinds[kind],`<div class="kv">${row('连接地址',esc(addr||'尚未设置'))}${row('端口',n.port??'—')}</div>${hy2Note}${buttons}`,action);
 }
 function reportTable(report) {
   const stats = [
+    {label:'落地机房', value:r=>r.colo?pill(r.colo,'neutral'):'—'},
     {label:'成功率', value:r=>`${number(100*r.successes/r.attempts,1)}% <small>（${r.successes}/${r.attempts}）</small>`},
     {label:'握手中位数', value:r=>r.median_ms==null?'—':number(r.median_ms)+' ms'},
     {label:'Cloudflare 边缘下载', value:r=>r.download_mbps!=null?number(r.download_mbps)+' Mbps':
@@ -252,9 +260,14 @@ function reportTable(report) {
 }
 function reportBaseline(baseline) {
   if(!baseline)return '';
+  const colo=baseline.colo?' · 机房 '+esc(baseline.colo):'';
   const latency=baseline.median_ms==null?'':' · 握手中位数 '+number(baseline.median_ms)+' ms';
   const failure=baseline.error?' · '+esc(baseline.error):'';
-  return `<p class="muted">原始入口 · ${baseline.successes}/${baseline.attempts} 次握手成功${latency}${failure}</p>`;
+  return `<p class="muted">原始入口 · ${baseline.successes}/${baseline.attempts} 次握手成功${colo}${latency}${failure}</p>`;
+}
+function reportDiagnosis(diagnosis) {
+  if(!diagnosis?.length)return '';
+  return diagnosis.map(text=>`<p class="node-change-note">${esc(text)}</p>`).join('');
 }
 function nodeHealth(n) {
   const health=n.health||{};
@@ -334,7 +347,7 @@ async function nodePage(n,seq) {
         report=detail;
         title='报告详情';
         crumbs.push([null,'报告详情']);
-        html=card(report.name,`<p class="report-meta">${reportMeta(report)}<span>${report.usable} / ${report.count} 个地址握手成功</span></p>${reportBaseline(report.baseline)}<p class="muted">按握手成功率、Cloudflare 边缘下载速度和握手延迟排序。下载只测初筛前列候选，结果不代表 VLESS 实际吞吐量。</p>${region('report-status')}${reportTable(report)}`,
+        html=card(report.name,`<p class="report-meta">${reportMeta(report)}<span>${report.usable} / ${report.count} 个地址握手成功</span></p>${reportBaseline(report.baseline)}${reportDiagnosis(report.diagnosis)}<p class="muted">按握手成功率、Cloudflare 边缘下载速度和握手延迟排序。下载只测初筛前列候选，结果不代表 VLESS 实际吞吐量。</p>${region('report-status')}${reportTable(report)}`,
           deleteReportButton(report,'删除报告'));
       }else{
         const reports=await api('reports');
@@ -347,7 +360,7 @@ async function nodePage(n,seq) {
       html=empty(err.message);
       actions+=btn('refresh','重试','refresh','ghost');
     }
-    if(!tail) html=clientTools()+html;
+    if(!tail) html=clientTools(n)+html;
   }else if(!section){
     html=region('node-status-error',stale(nodeError,server.checked_at))+region('node-connection',connectionContent(n));
     actions+=region('node-badge',stateOf(n));
@@ -704,17 +717,21 @@ function updateNodeForm(form) {
   const target=form.elements['target'].value;
   const node=getNode(target);
   const proxyLabel=form.querySelector('.proxy-option');
+  const hy2Bandwidth=form.querySelector('#hy2-bandwidth');
   proxyLabel.hidden=target!=='vless';
   form.querySelector('#cloudflare-hint').hidden=target!=='vless';
+  hy2Bandwidth.hidden=target!=='hy2';
   form.elements['cloudflare'].checked=target==='vless' && Boolean(node?.cloudflare);
+  form.elements['up_mbps'].value=target==='hy2' && node?.up_mbps ? node.up_mbps : '';
+  form.elements['down_mbps'].value=target==='hy2' && node?.down_mbps ? node.down_mbps : '';
   form.elements['domain'].value=node?.domain||'';
   form.elements['domain'].placeholder=target==='vless'?'ws.example.com':'hy2.example.com';
   form.elements['email'].value=node?.email||'';
-  form.elements['port'].value=node?.port||443;
+  form.elements['port'].value=node?.port||(target==='hy2'?8443:443);
   form.querySelector('#port-label').textContent=target==='vless'?'VLESS 公网端口（TCP）':'Hysteria 2 公网端口（UDP）';
   form.querySelector('#node-port-hint').textContent=target==='vless'
-    ? '使用 Cloudflare 代理时，请填写受支持的 HTTPS 端口。'
-    : '请将节点域名直接解析到 VPS，并放行该 UDP 端口。';
+    ? '使用 Cloudflare 代理时，请填写受支持的 HTTPS 端口（443、2053、2083、2087、2096、8443）。'
+    : '请将节点域名直接解析到 VPS（仅 DNS），并在防火墙放行该 UDP 端口（推荐避开 443）。';
 }
 function nodeForm(preferred, editing=false) {
   const protocols = editing ? [preferred] : availableProtocols();
@@ -730,8 +747,13 @@ function nodeForm(preferred, editing=false) {
       <label class="field">节点域名<input name="domain" autocomplete="off" required maxlength="253" spellcheck="false" inputmode="url" ${protocols.length===1?'autofocus':''}></label>
       <label class="field">证书邮箱<input name="email" type="email" autocomplete="email" required maxlength="254"></label>
       <label class="field"><span id="port-label">公网端口</span><input name="port" type="number" required min="1" max="65535" step="1" aria-describedby="node-port-hint"><small id="node-port-hint"></small></label>
+      <div id="hy2-bandwidth">
+        <label class="field">服务端上行带宽（Mbps，可选）<input name="up_mbps" type="number" min="1" max="10000" step="1" placeholder="留空使用 BBR，如 100"></label>
+        <label class="field">服务端下行带宽（Mbps，可选）<input name="down_mbps" type="number" min="1" max="10000" step="1" placeholder="同时填写上下行以启用 Brutal，如 300"></label>
+        <p class="muted">留空使用 BBR；Hysteria 2 分享链接不含带宽参数，填写服务器上下行带宽后，还需在客户端本地配置中填写带宽以激活 Brutal 抗丢包拥塞控制。</p>
+      </div>
       <label class="proxy-option"><input type="checkbox" name="cloudflare">使用 Cloudflare 代理</label>
-      <p class="muted" id="cloudflare-hint">勾选后还需在 Cloudflare 控制台把该 DNS 记录设为“已代理”（橙色云）。</p>
+      <p class="muted" id="cloudflare-hint">首次创建建议先在 Cloudflare 设为“仅 DNS”（灰色云）以签发证书；节点启动后再点亮“已代理”（橙色云），并将 Cloudflare SSL/TLS 加密模式设为“完全（严格）/ Full (Strict)”。</p>
       <p class="muted">先把节点域名指向这台 VPS，再在安全组和防火墙放行 TCP 80 和节点端口。</p>
       ${editing?`<p class="node-change-note">域名或端口变更后，请重新导入该节点的分享链接。${target==='vless'?'优选地址需要重新测速。':''}</p>`:''}
       <button class="btn primary" type="submit">${action}</button>
@@ -794,7 +816,7 @@ document.addEventListener('click',async e=>{
     if(action==='delete-report'){confirmReportDeletion(b.dataset.id,b.dataset.name);return;}
     if(action==='delete-release'){confirmReleaseDeletion(b.dataset.id);return;}
     if(action==='manual'){
-      modal('自选入口',`<form id="manual-form"><label class="field">IP 或域名<input required maxlength="253" name="address" value="${esc(getNode('vless').entries.manual||'')}" placeholder="输入自选地址"></label><button class="btn primary" type="submit">预览链接与二维码</button></form>`);return;
+      modal('自选入口',`<form id="manual-form"><label class="field">IP 或域名<input required maxlength="253" name="address" value="${esc(getNode('vless').entries.manual||'')}" placeholder="输入自选优选 IP 或优选域名（自动保留原域名 SNI/Host）"></label><button class="btn primary" type="submit">预览链接与二维码</button></form>`);return;
     }
     b.disabled=true;
     if(action==='download-task'){
@@ -832,6 +854,13 @@ dialog.addEventListener('submit',async e=>{
         email:data.get('email').trim(),port:Number(data.get('port'))
       };
       if(target==='vless')payload.cloudflare=data.has('cloudflare');
+      if(target==='hy2'){
+        const up=String(data.get('up_mbps')||'').trim();
+        const down=String(data.get('down_mbps')||'').trim();
+        payload.up_mbps=up?Number(up):0;
+        payload.down_mbps=down?Number(down):0;
+        if(Boolean(payload.up_mbps)!==Boolean(payload.down_mbps))throw Error('配置 Hysteria 2 Brutal 带宽时，需同时填写上行和下行带宽');
+      }
       await queueJob(payload);
       if(dialog.open && f.isConnected)dialog.close();
     }

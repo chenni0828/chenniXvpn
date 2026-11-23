@@ -21,7 +21,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from client.cf_speedtest import Node, address_value
-from frontend.diagnostics import parse_report_with_metadata
+from frontend.diagnostics import diagnose_report, parse_report_with_metadata
 from frontend.traffic import Store, collect, interfaces
 from server.passwords import MAX_BASIC_AUTH_HEADER, read_admin_hash, verify_password
 from server.releases import version_key
@@ -178,7 +178,7 @@ class Panel:
             return self.host.operate("job", id=parts[1])
         if method == "POST" and path == "jobs":
             fields = {"operation", "target", "domain", "port", "email", "cloudflare", "open_firewall",
-                      "version", "cert", "release_id"}
+                      "up_mbps", "down_mbps", "version", "cert", "release_id"}
             if not body.keys() <= fields:
                 raise HttpError(400, "任务请求含有未知字段")
             return self.host.operate("start", **body)
@@ -211,11 +211,17 @@ class Panel:
                 node["entries"] = {}
                 node["latest"] = None
             vless = next((n for n in result["nodes"] if n["protocol"] == "vless"), None)
+            legacy_key = vless.pop("legacy_key", None) if vless else None
+            migrate = bool(vless and vless.get("key") and legacy_key and legacy_key != vless["key"])
             kinds = []
             sharing_error = None
             try:
                 with self.store.db() as db:
-                    db.execute("BEGIN")
+                    db.execute("BEGIN IMMEDIATE" if migrate else "BEGIN")
+                    if migrate:
+                        db.execute("UPDATE reports SET node=? WHERE node=?", (vless["key"], legacy_key))
+                        db.execute("UPDATE OR IGNORE entries SET node=? WHERE node=?", (vless["key"], legacy_key))
+                        db.execute("DELETE FROM entries WHERE node=?", (legacy_key,))
                     kinds = self.entry_kinds(db)
                     if vless and vless["key"]:
                         reports = self.reports(db, vless["key"], latest=True)
@@ -251,6 +257,7 @@ class Panel:
                     view["target_verified"] = view["measured_at"] is not None
                     view["rows"] = json.loads(view.pop("rows_json"))
                     view["baseline"] = json.loads(view.pop("baseline_json") or "null")
+                    view["diagnosis"] = diagnose_report(view["rows"], view["baseline"])
                     return view
                 if method == "POST" and len(parts) == 3 and parts[1].isdigit() and parts[2] == "delete":
                     db.execute("DELETE FROM reports WHERE id=?", (parts[1],))

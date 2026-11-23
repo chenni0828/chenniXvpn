@@ -5,9 +5,8 @@ usage() {
     cat <<'HELP'
 sudo bash install.sh [--upgrade | --reconfigure | --status]
 sudo bash install.sh --from-github [TAG] [--upgrade]
-  --mode ssh --ssh-host [user@]主机或SSH别名 [--ssh-port SSH端口]
-  --mode https --domain 管理域名 --email 证书邮箱
-  --port 管理端口     --non-interactive     --admin-password-stdin
+  --domain 管理域名 --email 证书邮箱 [--port HTTPS端口]
+  --non-interactive     --admin-password-stdin
   --dry-run 预览      --quiet 精简日志      --status --json 查询本机
 HELP
 }
@@ -19,7 +18,7 @@ for arg in "$@"; do
     case "$arg" in
         --help|-h) usage; exit 0 ;;
         --from-github|--from-github=*) remote=true ;;
-        --status|--reconfigure) local_action=true ;;
+        --status) local_action=true ;;
     esac
 done
 
@@ -27,7 +26,7 @@ if [[ ! -x /usr/bin/python3 ]]; then
     printf '安装前校验需要 /usr/bin/python3。请先安装 python3，再重新运行。\n' >&2
     exit 1
 fi
-unset CHENNIXVPN_VERIFIED_ARCHIVE_SHA256
+unset CHENNIXVPN_VERIFIED_ARCHIVE_SHA256 CHENNIXVPN_PLATFORM_VALIDATED
 if [[ $remote == false ]]; then
     if [[ ! -f $here/server/deployment.py && $local_action == true ]]; then
         here=/opt/chennixvpn/current
@@ -39,7 +38,7 @@ if [[ $remote == false ]]; then
     exec /usr/bin/python3 -IB "$here/server/deployment.py" "$@"
 fi
 if [[ $local_action == true ]]; then
-    printf '%s\n' '--status 与 --reconfigure 读取本机安装，请单独使用。' >&2
+    printf '%s\n' '--status 读取本机安装，请单独使用。' >&2
     exit 2
 fi
 if (( EUID != 0 )); then
@@ -68,6 +67,8 @@ if [[ ! -s /etc/ssl/certs/ca-certificates.crt ]]; then
     printf '验证 GitHub HTTPS 需要 ca-certificates。请安装后重试。\n' >&2
     exit 1
 fi
+
+export CHENNIXVPN_PLATFORM_VALIDATED=1
 
 # Both GitHub entry points use the same verifier. FD 0 belongs to the installer.
 exec /usr/bin/python3 -IB /dev/fd/3 "$@" 3<<'PY'
