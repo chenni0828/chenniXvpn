@@ -134,11 +134,13 @@ def install_latest(tag):
 def current_release_id():
     try:
         target = os.readlink(deploy.CURRENT)
-    except OSError:
+        current = (deploy.CURRENT.parent / target).resolve(strict=True)
+        releases = (deploy.BASE / "releases").resolve(strict=True)
+    except (OSError, RuntimeError):
         raise RuntimeError("无法确认当前面板版本，已停止清理。") from None
-    if "/" in target or "\\" in target or not RELEASE_ID.fullmatch(target):
+    if current.parent != releases or not current.is_dir() or not RELEASE_ID.fullmatch(current.name):
         raise RuntimeError("当前面板目录不符合版本管理要求，已停止清理。")
-    return target
+    return current.name
 
 
 def release_source(path):
